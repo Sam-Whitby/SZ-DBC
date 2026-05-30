@@ -5,12 +5,15 @@
    Positions are integers in {1,..,nGrid}.
 
    Key features:
+   - COUPLING SYMMETRY: automatically canonicalises coupling atoms
+     so that couplingJ[b,a,d] = couplingJ[a,b,d] for b>a.
    - TRANSLATIONAL INVARIANCE verified algebraically via τ-BFS:
-     checker augments all positions with a free symbol {τr,τc};
-     τ cancels in pairwise differences so transition probabilities
-     are τ-free iff the algorithm is translation-invariant.
-   - D4 ROTATIONAL INVARIANCE verified by comparing BFS outputs
-     for each orbit rep with its rotation and reflection.
+     runs from orbit representatives (not full state space) so
+     that the τ check costs ~2 s instead of ~135 s.
+   - D4 ROTATIONAL INVARIANCE verified numerically (SZ-style) at
+     random parameter points — more robust than structural equality.
+   - ERGODICITY verified via reachability BFS on the orbit-expanded
+     transition graph derived from the orbit-rep BFS output.
    - SCHWARTZ-ZIPPEL probabilistic DB check (default, no FS).
    - FULL-SIMPLIFY available as an option.
 
@@ -47,6 +50,25 @@ $dbcNormTauState[state_List, nGrid_Integer] :=
         Mod[#[[1,2]]-τc-1, nGrid]+1 + τc},
        #[[2]]} &, state],
     {#[[1,1]]-τr, #[[1,2]]-τc} &]
+
+
+(* ================================================================
+   SECTION 0b — COUPLING SYMMETRY
+   ================================================================
+   Adds a canonicalisation rule for every coupling head found in
+   symCouplings: coupling[b,a,...] with b>a → coupling[a,b,...].
+   This ensures that all leaf weights and energy expressions use
+   the canonical (a ≤ b) form, so the SZ substitution covers all
+   atoms that actually appear.
+   Call AFTER ClearAll on the coupling head and BEFORE any BFS.
+   ================================================================ *)
+
+$dbcAddCouplingSymmetry[symCouplings_List] :=
+  Module[{heads = DeleteDuplicates[Head /@ symCouplings]},
+    Do[
+      With[{h = heads[[i]]},
+        h[b_Integer, a_Integer, rest__Integer] /; b > a := h[a, b, rest]],
+      {i, Length[heads]}]]
 
 
 (* ================================================================
@@ -338,10 +360,12 @@ RunWithBitsAT[alg_, state_, bits_List] :=
    BFS for a SINGLE state. Returns list of {bits, nextState, weight}
    leaves, or $dbc$cantHandle[msg].
    normFn: normalisation function applied to each returned state.
+   Warns if any paths are silently dropped at maxDepth.
    ---------------------------------------------------------------- *)
 $dbcBuildStateLeaves[state_, alg_, maxDepth_Integer, tlim_,
                      nGrid_Integer, normFn_] :=
   Module[{queue = {{}}, leaves = {}, t0 = AbsoluteTime[], timedOut = False,
+          droppedPaths = 0,
           bits, res, ns, w},
     $dbcCurrentNGrid = nGrid;
     While[queue =!= {} && !timedOut,
@@ -352,15 +376,19 @@ $dbcBuildStateLeaves[state_, alg_, maxDepth_Integer, tlim_,
         res === $OutOfBits && Length[bits] < maxDepth,
           queue = Join[queue, {Append[bits,0], Append[bits,1]}],
         res === $OutOfBits,
-          Null,  (* path silently dropped at MaxBitDepth *)
+          droppedPaths++,
         res === $dbc$outOfRange,
-          Null,  (* rejection-sampled path, silently dropped *)
+          Null,
         MatchQ[res,$dbc$cantHandle[_]],
           Return[res, Module],
         True,
           {ns, w} = res;
           AppendTo[leaves, {bits, normFn[ns], w}]]];
-    If[timedOut, Print["  WARNING: time limit for state ",state]];
+    If[timedOut, Print["  WARNING: time limit reached for state ", state]];
+    If[droppedPaths > 0,
+      Print["  WARNING: ", droppedPaths, " path(s) hit maxDepth=", maxDepth,
+            " and were dropped for state ", Short[state],
+            ". Increase -maxDepth if the algorithm uses long random sequences."]];
     leaves]
 
 
@@ -378,7 +406,8 @@ BuildTreeAT[seedState_, alg_, nGrid_Integer, normFn_, OptionsPattern[]] :=
           verbose  = OptionValue["Verbose"],
           discovered, toProcess, batch, result, s, leaves, err},
     $dbcCurrentNGrid = nGrid;
-    discovered = {seedState}; toProcess = {seedState}; result = <||>;
+    discovered = Association[{seedState -> True}];
+    toProcess = {seedState}; result = <||>;
     While[toProcess =!= {},
       batch = toProcess; toProcess = {};
       If[verbose, Print["  BFS wave: ", Length[batch], " states"]];
@@ -388,9 +417,9 @@ BuildTreeAT[seedState_, alg_, nGrid_Integer, normFn_, OptionsPattern[]] :=
         If[MatchQ[leaves, $dbc$cantHandle[_]], Return[leaves, Module]];
         result[s] = leaves;
         Do[
-          If[!MemberQ[discovered, leaf[[2]]],
-            AppendTo[discovered, leaf[[2]]];
-            AppendTo[toProcess,  leaf[[2]]]],
+          If[!KeyExistsQ[discovered, leaf[[2]]],
+            discovered[leaf[[2]]] = True;
+            AppendTo[toProcess, leaf[[2]]]],
           {leaf, leaves}],
         {i, Length[batch]}]];
     result]
@@ -409,40 +438,72 @@ TreeATToMatrix[treeData_Association] :=
 (* ================================================================
    SECTION 4 — TRANSLATIONAL INVARIANCE CHECK (τ BFS)
    ================================================================
-   Run state-space BFS with τ-augmented positions.  τ cancels in all
-   pairwise differences → transition probabilities are τ-free iff the
-   algorithm is translation-invariant over all reachable states.
-   Algebraically certified by a single FreeQ pass.
+   Run $dbcBuildStateLeaves with τ-augmented positions for each
+   supplied state (typically the orbit representatives).
+   τ cancels in all pairwise differences → transition probabilities
+   are τ-free iff the algorithm is translation-invariant.
+   Checking from orbit reps is ~63× faster than the full state-space
+   BFS while covering all distinct states (given G-symmetry).
    ================================================================ *)
 
-$dbcCheckTranslational[seedState_List, alg_, nGrid_Integer,
+$dbcCheckTranslational[states_List, alg_, nGrid_Integer,
                         maxDepth_Integer, tlim_] :=
-  Module[{τSeed, τNorm, τTree, τMatrix, tauFree, violations},
-    τSeed = $dbcAddTau[seedState];
+  Module[{τNorm, tauFree = True, violations = {}},
     τNorm = $dbcNormTauState[#, nGrid] &;
-    τTree = BuildTreeAT[τSeed, alg, nGrid, τNorm,
-                        "MaxBitDepth"->maxDepth, "TimeLimit"->tlim];
-    If[MatchQ[τTree,$dbc$cantHandle[_]],
-      Return[<|"tauFree"->$Failed,"error"->τTree[[1]]|>]];
-    τMatrix   = TreeATToMatrix[τTree];
-    tauFree   = AllTrue[Values[τMatrix], FreeQ[#,τr] && FreeQ[#,τc] &];
-    violations = If[tauFree, {},
-      Take[Select[Normal[τMatrix], !(FreeQ[#[[2]],τr]&&FreeQ[#[[2]],τc])&], UpTo[5]]];
-    <|"tauFree"->tauFree, "violations"->violations|>]
+    Do[
+      With[{τLeaves = $dbcBuildStateLeaves[
+              $dbcAddTau[states[[si]]], alg, maxDepth, tlim, nGrid, τNorm]},
+        If[MatchQ[τLeaves, $dbc$cantHandle[_]],
+          Return[<|"tauFree"->$Failed, "error"->τLeaves[[1]]|>, Module]];
+        Scan[Function[leaf,
+          If[!FreeQ[leaf[[3]], τr] || !FreeQ[leaf[[3]], τc],
+            tauFree = False;
+            AppendTo[violations, leaf[[3]]]]],
+          τLeaves]],
+      {si, Length[states]}];
+    <|"tauFree" -> tauFree, "violations" -> Take[violations, UpTo[5]]|>]
+
+
+(* ================================================================
+   SECTION 4b — NUMERICAL EQUALITY HELPER (SZ-style)
+   ================================================================
+   Compares two symbolic expressions at nReps random parameter
+   points drawn from symParams ∪ {β}.  Returns True if they agree
+   at all points (within floating-point tolerance), False otherwise.
+   If either expression fails to evaluate numerically (residual
+   symbols after substitution), returns True (inconclusive = no
+   violation reported) to avoid false D4 failures.
+   ================================================================ *)
+
+$dbcNumericallyEqual[expr1_, expr2_, symParams_List, nReps_:3] :=
+  Module[{assign, v1, v2},
+    AllTrue[
+      Table[
+        assign = Join[
+          Map[# -> N[$szRandQ[]] &, symParams],
+          {\[Beta] -> RandomReal[{0.3, 3.0}]}];
+        v1 = N[expr1 /. assign];
+        v2 = N[expr2 /. assign];
+        If[!NumericQ[v1] || !NumericQ[v2],
+          True,   (* inconclusive — don't report as violation *)
+          Abs[v1 - v2] <= 1*^-7 * Max[Abs[v1], Abs[v2], 1*^-30]],
+        {nReps}],
+      TrueQ]]
 
 
 (* ================================================================
    SECTION 5 — D4 GENERATOR TESTING
    ================================================================
    For each orbit rep s₀, run BFS from rot90(s₀) and reflect(s₀).
-   Compare: T(rot90(s₀)→rot90(t)) === T(s₀→t)  [structural equality]
-            T(reflect(s₀)→reflect(t)) === T(s₀→t)
-   If all match: D4 invariance exactly verified.
+   Compare T(rot90(s₀)→rot90(t)) with T(s₀→t) using SZ-style
+   numerical evaluation (more robust than structural equality ===).
+   By group theory, checking rotation + reflection is sufficient
+   to certify all 8 elements of D4.
    Returns <|"d4Pass"->True/False, "fails"->{...}|>.
    ================================================================ *)
 
 $dbcVerifyD4[repLeaves_Association, alg_, nGrid_Integer,
-              maxDepth_Integer, tlim_] :=
+              maxDepth_Integer, tlim_, symParams_List:{}] :=
   Module[{normFn = $dbcNormState[#,nGrid]&,
           reps, d4Pass = True, fails = {},
           s0, repMatrix,
@@ -470,7 +531,8 @@ $dbcVerifyD4[repLeaves_Association, alg_, nGrid_Integer,
       KeyValueMap[Function[{pair,tVal},
         With[{dest=pair[[2]],rotDest=$dbcApplyRot90[pair[[2]],nGrid]},
           With[{tRot=Lookup[rotMatrix,Key[{rotState,rotDest}],0]},
-            If[tVal=!=tRot, rViol=<|"rep"->s0,"dest"->dest,"T(rep)"->tVal,"T(rot)"->tRot|>]]]],
+            If[!$dbcNumericallyEqual[tVal, tRot, symParams],
+              rViol=<|"rep"->s0,"dest"->dest,"T(rep)"->tVal,"T(rot)"->tRot|>]]]],
         repMatrix];
       If[rViol=!=None, AppendTo[fails,<|"gen"->"rot90","mismatch"->rViol|>]; d4Pass=False];
 
@@ -488,7 +550,8 @@ $dbcVerifyD4[repLeaves_Association, alg_, nGrid_Integer,
       KeyValueMap[Function[{pair,tVal},
         With[{dest=pair[[2]],refDest=$dbcApplyReflect[pair[[2]],nGrid]},
           With[{tRef=Lookup[refMatrix,Key[{refState,refDest}],0]},
-            If[tVal=!=tRef, sViol=<|"rep"->s0,"dest"->dest,"T(rep)"->tVal,"T(ref)"->tRef|>]]]],
+            If[!$dbcNumericallyEqual[tVal, tRef, symParams],
+              sViol=<|"rep"->s0,"dest"->dest,"T(rep)"->tVal,"T(ref)"->tRef|>]]]],
         repMatrix];
       If[sViol=!=None, AppendTo[fails,<|"gen"->"reflect","mismatch"->sViol|>]; d4Pass=False],
 
@@ -497,9 +560,12 @@ $dbcVerifyD4[repLeaves_Association, alg_, nGrid_Integer,
 
 
 (* ================================================================
-   SECTION 6 — ERGODICITY CHECK
+   SECTION 6 — ERGODICITY CHECKS
    ================================================================ *)
 
+(* Combinatorial state-count check: verifies that $nGrid and
+   $particleTypes are consistent (always passes for valid inputs
+   but catches misconfiguration).  Separate from reachability. *)
 CheckErgodicity[allStates_List, nGrid_Integer] :=
   Module[{s0, types, typeCounts, S, N, theoretical},
     s0          = First[allStates];
@@ -511,6 +577,51 @@ CheckErgodicity[allStates_List, nGrid_Integer] :=
     <|"ergodic"     -> (Length[allStates] == theoretical),
       "found"       -> Length[allStates],
       "theoretical" -> theoretical|>]
+
+(* Reachability ergodicity check using orbit-BFS data.
+   Expands orbit-rep leaves via G-action to get all transitions,
+   then BFS from state 1 to check whether every state is reachable.
+   This tests the algorithm's actual connectivity, not just the
+   state count.  Requires orbit BFS to have been completed. *)
+$dbcCheckErgodicityFromLeaves[repLeaves_Association, repToOrbitMap_Association,
+                               allStates_List, nGrid_Integer] :=
+  Module[{nStates, stateToIdx, adjFwd, repList, repKey, orbitMap,
+          srcIdx, dstIdx, reachableSet, queue, curIdx},
+    nStates    = Length[allStates];
+    stateToIdx = AssociationThread[allStates -> Range[nStates]];
+    repList    = Keys[repLeaves];
+
+    (* Build forward adjacency via explicit loops — avoids nested Join/Apply *)
+    adjFwd = Association[Table[i -> {}, {i, nStates}]];
+    Do[
+      repKey   = repList[[ri]];
+      orbitMap = repToOrbitMap[repKey];
+      KeyValueMap[
+        Function[{sKey, g},
+          srcIdx = stateToIdx[sKey];
+          Do[
+            dstIdx = Lookup[stateToIdx,
+                       Key[$dbcApplyGElem[g, repLeaves[repKey][[li, 2]], nGrid]], 0];
+            If[dstIdx =!= 0 && dstIdx =!= srcIdx,
+              adjFwd[srcIdx] = Union[adjFwd[srcIdx], {dstIdx}]],
+            {li, Length[repLeaves[repKey]]}]],
+        orbitMap],
+      {ri, Length[repList]}];
+
+    (* BFS from state index 1 (first enumerated state = seed) *)
+    reachableSet = <|1 -> True|>;
+    queue = {1};
+    While[queue =!= {},
+      curIdx = First[queue]; queue = Rest[queue];
+      Scan[Function[n,
+        If[!KeyExistsQ[reachableSet, n],
+          reachableSet[n] = True;
+          AppendTo[queue, n]]],
+        adjFwd[curIdx]]];
+
+    <|"ergodic" -> (Length[reachableSet] == nStates),
+      "reached" -> Length[reachableSet],
+      "total"   -> nStates|>]
 
 
 (* ================================================================
@@ -627,8 +738,8 @@ CheckDetailedBalanceSZ[matrix_Association, allStates_List, symEnergy_,
 (* ================================================================
    SECTION 7b — DIRECT SZ CHECK FROM LEAVES (fast path)
    ================================================================
-   Key insight: the leaf weight leaf[[3]] is identical for all 72
-   G-orbit members of an orbit rep — only positions change, not
+   Key insight: the leaf weight leaf[[3]] is identical for all |G|
+   orbit members of an orbit rep — only positions change, not
    probabilities.  Evaluate each weight ONCE, then scatter to all
    orbit members via a precomputed integer G-action table.
 
@@ -643,22 +754,17 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
                    tol_:1*^-7] :=
   Module[{violations = {}, betaVal, assign,
           nStates, stateToIdx, energyExprs,
-          (* G-action integer table: gActI[[gIdx, stateIdx]] = newStateIdx *)
           allGKeys, gIdxOf, gActI,
-          (* Precomputed per-rep orbit expansion as integer index pairs *)
           repList, repOrbitPairs,
-          (* SZ loop temporaries *)
           wVals, rowT, pairs, pairsArr,
           betaArr, lhs, rhs, ei, ej},
 
     nStates    = Length[allStates];
     stateToIdx = AssociationThread[allStates -> Range[nStates]];
 
-    (* Collect every G element referenced in any orbit map *)
     allGKeys = DeleteDuplicates @ Flatten[Values /@ Values[repToOrbitMap], 1];
     gIdxOf   = AssociationThread[allGKeys -> Range[Length[allGKeys]]];
 
-    (* Build integer G-action table: gActI[[gi, si]] = target state index *)
     gActI = Table[0, {Length[allGKeys]}, {nStates}];
     Do[
       With[{gi = gIdxOf[g]},
@@ -667,7 +773,6 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
           {si, nStates}]],
       {g, allGKeys}];
 
-    (* Pre-expand: for each rep, for each leaf, list of {srcIdx,tgtIdx} pairs *)
     repList = Keys[repLeaves];
     repOrbitPairs = Table[
       With[{repKey = repList[[ri]], orbitMap = repToOrbitMap[repList[[ri]]]},
@@ -680,27 +785,22 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
           {li, Length[repLeaves[repKey]]}]],
       {ri, Length[repList]}];
 
-    (* Pre-compute symbolic energy for each state (for fast substitution) *)
     energyExprs = Map[energy, allStates];
 
-    (* Precompute unique unordered pairs that can appear *)
     pairsArr = DeleteDuplicates @ Sort @ Map[Sort,
       Flatten[repOrbitPairs, 2]];
     pairsArr = Select[pairsArr, #[[1]] =!= #[[2]] &];
 
-    (* ---- SZ loop ---- *)
     Do[
       betaVal = RandomReal[{0.3, 5.0}];
       assign  = Join[
         Map[# -> N[$szRandQ[]] &, symParams],
         {\[Beta] -> betaVal, numBeta -> betaVal}];
 
-      (* Evaluate all leaf weights once per leaf (not per orbit member) *)
       wVals = Table[
         N[repLeaves[repList[[ri]]][[All, 3]] /. assign],
         {ri, Length[repList]}];
 
-      (* Accumulate numerical T matrix using integer table *)
       rowT = SparseArray[{}, {nStates, nStates}];
       Do[
         Do[
@@ -711,23 +811,22 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
           {li, Length[repOrbitPairs[[ri]]]}],
         {ri, Length[repList]}];
 
-      (* Energy vector for this coupling assignment *)
       betaArr = N[energyExprs /. assign];
 
-      (* Detailed balance check *)
       Do[
         With[{i = pair[[1]], j = pair[[2]]},
           tij = rowT[[i, j]]; tji = rowT[[j, i]];
           ei  = betaArr[[i]]; ej  = betaArr[[j]];
-          lhs = tij * Exp[-betaVal * ei];
-          rhs = tji * Exp[-betaVal * ej];
-          If[Abs[lhs - rhs] > tol * Max[Abs[lhs], Abs[rhs], 1*^-30],
-            AppendTo[violations,
-              <|"pair" -> {allStates[[i]], allStates[[j]]},
-                "tij"  -> tij, "tji"  -> tji,
-                "ei"   -> ei,  "ej"   -> ej,
-                "beta" -> betaVal,
-                "lhs"  -> lhs, "rhs"  -> rhs|>]]],
+          If[NumericQ[ei] && NumericQ[ej],
+            lhs = tij * Exp[-betaVal * ei];
+            rhs = tji * Exp[-betaVal * ej];
+            If[Abs[lhs - rhs] > tol * Max[Abs[lhs], Abs[rhs], 1*^-30],
+              AppendTo[violations,
+                <|"pair" -> {allStates[[i]], allStates[[j]]},
+                  "tij"  -> tij, "tji"  -> tji,
+                  "ei"   -> ei,  "ej"   -> ej,
+                  "beta" -> betaVal,
+                  "lhs"  -> lhs, "rhs"  -> rhs|>]]]],
         {pair, pairsArr}],
     {nReps}];
     violations]

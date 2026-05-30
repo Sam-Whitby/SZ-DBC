@@ -16,7 +16,7 @@
 
    The algorithm file must define:
      Algorithm[state_]      — MCMC step, state = {{{r,c},type},...}
-     energy[state_]         — total energy (no β factor)
+     energy[state_]         — bare energy (no β factor)
      $nGrid                 — integer lattice side length
      $particleTypes         — type multiset, e.g. {1,2,3}
      $seedState             — canonical seed state
@@ -73,6 +73,25 @@ useFS       = (mode === "FullSimplify");
 doNumerical = (mode === "Numerical");
 
 
+(* ---- Coupling atoms: clear any pre-existing numeric assignments,
+        then install the canonicalisation symmetry rule so that
+        couplingJ[b,a,d] with b>a → couplingJ[a,b,d] throughout. ---- *)
+symParamData = If[ValueQ[DynamicSymParams],
+  DynamicSymParams[{seedState}],
+  <|"couplings"->{}, "numericParams"->{}|>];
+symCouplings = symParamData["couplings"];
+symParamList = symCouplings;
+
+(* Clear the coupling head symbol(s) to remove any residual assignments *)
+Scan[ClearAll, DeleteDuplicates[Head /@ symCouplings]];
+
+(* Add symmetry rule: couplingJ[b,a,d]/;b>a := couplingJ[a,b,d] *)
+$dbcAddCouplingSymmetry[symCouplings];
+
+(* Declare extra assumptions for DB check: all couplings real *)
+extraAssumptions = Map[Element[#, Reals]&, symCouplings];
+
+
 (* ---- Helpers ---- *)
 sep  = "================================================================";
 sep2 = "----------------------------------------------------------------";
@@ -80,22 +99,6 @@ sep2 = "----------------------------------------------------------------";
 printHeader[title_] := (Print[sep]; Print["  ", title]; Print[sep])
 printSection[title_] := (Print[sep2]; Print["  ", title]; Print[sep2])
 
-
-(* ================================================================
-   STEP 0 — Clear abstract parameters before symbolic BFS
-   ================================================================ *)
-
-symParamData = If[ValueQ[DynamicSymParams],
-  DynamicSymParams[{seedState}],
-  <|"couplings"->{}, "numericParams"->{}|>];
-symCouplings = symParamData["couplings"];
-symParamList = symCouplings;  (* atoms to keep abstract *)
-
-(* Clear abstract param values so BFS remains symbolic *)
-Scan[ClearAll, Map[ToString, symCouplings]];
-
-(* Declare extra assumptions for DB check: all couplings real *)
-extraAssumptions = Map[Element[#, Reals]&, symCouplings];
 
 printHeader["SZ-DBC  —  " <> FileNameTake[algFile]];
 Print["  nGrid      : ", nGrid];
@@ -107,79 +110,95 @@ Print[""];
 
 
 (* ================================================================
-   STEP 1 — Translational invariance check (τ-BFS)
+   STEP 1 — Enumerate N-particle state space + combinatorial count
    ================================================================ *)
 
-tauResult = <|"tauFree"->True|>;   (* default if no translation claimed *)
-
-If[wantTrans && mode =!= "Numerical",
-  printSection["Step 1: Translational invariance (τ-BFS)"];
-  tauResult = $dbcCheckTranslational[seedState, Algorithm, nGrid, maxDepth, timeLimit];
-  If[tauResult["tauFree"] === $Failed,
-    Print["  ERROR during τ-BFS: ", tauResult["error"]];
-    Print["  Continuing without translational symmetry speedup."];
-    wantTrans = False,
-  If[tauResult["tauFree"],
-    Print["  PASS  — translation invariance algebraically verified"],
-    Print["  FAIL  — τ appears in transition probabilities (translation-dependence detected)"];
-    Print["  First violations:"];
-    Scan[Print["    ", #]&, tauResult["violations"]];
-    Print["  Continuing without translational symmetry."];
-    wantTrans = False]]];
-
-
-(* ================================================================
-   STEP 2 — Enumerate N-particle state space
-   ================================================================ *)
-
-printSection["Step 2: State enumeration"];
-t2 = AbsoluteTime[];
+printSection["Step 1: State enumeration"];
+t1 = AbsoluteTime[];
 allStates = $dbcEnumerateNParticleStates[seedState, nGrid];
-Print["  States found : ", Length[allStates], "  (", Round[AbsoluteTime[]-t2,0.01], "s)"];
+Print["  States found : ", Length[allStates], "  (", Round[AbsoluteTime[]-t1,0.01], "s)"];
 
-
-(* ================================================================
-   STEP 3 — Ergodicity check (state count)
-   ================================================================ *)
-
-ergResult = CheckErgodicity[allStates, nGrid];
-Print["  Ergodicity   : ", If[ergResult["ergodic"],"PASS","FAIL"],
-      "  (found ", ergResult["found"],
-      ", theoretical ", ergResult["theoretical"], ")"];
-If[!ergResult["ergodic"],
+(* Combinatorial sanity check: validates $nGrid and $particleTypes *)
+ergCount = CheckErgodicity[allStates, nGrid];
+Print["  State count  : ", If[ergCount["ergodic"],"OK","MISMATCH"],
+      "  (found ", ergCount["found"],
+      ", theoretical ", ergCount["theoretical"], ")"];
+If[!ergCount["ergodic"],
   Print["  WARNING: state count mismatch. Check $particleTypes and $nGrid."]];
 
 
 (* ================================================================
-   STEP 4 — NUMERICAL MODE (early exit)
+   STEP 2 — G-orbit computation
+   ================================================================ *)
+
+printSection["Step 2: G-orbit computation"];
+t2 = AbsoluteTime[];
+allGElems = $dbcAllGElems[nGrid, symGroup];
+Print["  |G| = ", Length[allGElems]];
+{reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
+Print["  Orbit reps : ", Length[reps], "  (", Round[AbsoluteTime[]-t2,0.01], "s)"];
+
+
+(* ================================================================
+   STEP 3 — NUMERICAL MODE (early exit)
    ================================================================ *)
 
 If[doNumerical,
   printSection["Numerical MCMC check"];
   Print["  Running ", 100000, " steps at β=", numBetaVal, " ..."];
-  t4 = AbsoluteTime[];
+  t3 = AbsoluteTime[];
   counts   = RunNumericalMCMCAT[allStates, Algorithm, numBetaVal, nGrid];
   bweights = BoltzmannWeightsAT[allStates, energy, numBetaVal];
   nRun = Total[Values[counts]];
   maxDev = Max[Abs[N[Values[counts]]/nRun - N[Values[bweights]]]];
   Print["  Max deviation from Boltzmann: ", ScientificForm[maxDev, 3]];
-  Print["  Time: ", Round[AbsoluteTime[]-t4, 0.01], "s"];
+  Print["  Time: ", Round[AbsoluteTime[]-t3, 0.01], "s"];
   Print[sep];
   Exit[0]];
 
 
 (* ================================================================
-   STEP 5 — G-orbit computation & BFS from orbit reps
+   STEP 4 — Translational invariance check (τ-BFS from orbit reps)
+   ================================================================
+   Runs $dbcBuildStateLeaves from each orbit rep with τ-augmented
+   positions.  This covers all distinct states (via G-symmetry)
+   at ~1/63 of the cost of the full state-space BFS.
+   If translation invariance fails, orbit reps are recomputed
+   without the translation subgroup.
    ================================================================ *)
 
-printSection["Step 5: G-orbits & BFS"];
+tauResult = <|"tauFree"->True|>;
+
+If[wantTrans && mode =!= "Numerical",
+  printSection["Step 4: Translational invariance (τ-BFS from orbit reps)"];
+  t4 = AbsoluteTime[];
+  tauResult = $dbcCheckTranslational[reps, Algorithm, nGrid, maxDepth, timeLimit];
+  Print["  States checked : ", Length[reps], " orbit reps  (",
+        Round[AbsoluteTime[]-t4, 0.01], "s)"];
+  If[tauResult["tauFree"] === $Failed,
+    Print["  ERROR during τ-BFS: ", tauResult["error"]];
+    Print["  Continuing without translational symmetry speedup."];
+    wantTrans = False;
+    allGElems = $dbcAllGElems[nGrid, DeleteCases[symGroup,"translation"]];
+    {reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
+    Print["  Recomputed orbit reps without translation: ", Length[reps]],
+  If[tauResult["tauFree"],
+    Print["  PASS  — translation invariance algebraically verified"],
+    Print["  FAIL  — τ appears in transition probabilities"];
+    Scan[Print["    sample violation: ", Short[#,5]]&, tauResult["violations"]];
+    Print["  Recomputing orbit reps without translation symmetry."];
+    wantTrans = False;
+    allGElems = $dbcAllGElems[nGrid, DeleteCases[symGroup,"translation"]];
+    {reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
+    Print["  Orbit reps after recompute: ", Length[reps]]]]];
+
+
+(* ================================================================
+   STEP 5 — BFS from orbit representatives
+   ================================================================ *)
+
+printSection["Step 5: BFS from orbit reps"];
 t5 = AbsoluteTime[];
-allGElems = $dbcAllGElems[nGrid, If[wantTrans, symGroup, DeleteCases[symGroup,"translation"]]];
-Print["  |G|   = ", Length[allGElems]];
-
-{reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
-Print["  Orbit reps : ", Length[reps]];
-
 normFn = $dbcNormState[#, nGrid]&;
 repLeaves = <||>;
 err = None;
@@ -208,7 +227,7 @@ d4Result = <|"d4Pass"->True,"fails"->{}|>;
 If[wantD4,
   printSection["Step 6: D4 generator testing"];
   t6 = AbsoluteTime[];
-  d4Result = $dbcVerifyD4[repLeaves, Algorithm, nGrid, maxDepth, timeLimit];
+  d4Result = $dbcVerifyD4[repLeaves, Algorithm, nGrid, maxDepth, timeLimit, symCouplings];
   If[d4Result["d4Pass"],
     Print["  PASS  — D4 invariance verified (", Length[reps], " reps × 2 generators)"],
     Print["  FAIL  — D4 invariance violated:"];
@@ -217,7 +236,23 @@ If[wantD4,
 
 
 (* ================================================================
-   STEP 7 — Detailed balance check
+   STEP 7 — Ergodicity (reachability from orbit-BFS transition graph)
+   ================================================================ *)
+
+printSection["Step 7: Ergodicity (reachability check)"];
+t7 = AbsoluteTime[];
+ergoResult = $dbcCheckErgodicityFromLeaves[repLeaves, repToOrbitMap, allStates, nGrid];
+Print["  Reachable : ", ergoResult["reached"], "/", ergoResult["total"],
+      "  (", Round[AbsoluteTime[]-t7, 0.01], "s)"];
+If[ergoResult["ergodic"],
+  Print["  PASS  — all states reachable from seed"],
+  Print["  FAIL  — only ", ergoResult["reached"], " of ", ergoResult["total"],
+        " states are reachable."];
+  Print["  The algorithm may not be ergodic for this system size."]];
+
+
+(* ================================================================
+   STEP 8 — Detailed balance check
    ================================================================
    SZPure (default): evaluate leaf weights numerically at random
      {β, J...} points — Piecewise conditions resolve immediately,
@@ -225,11 +260,10 @@ If[wantD4,
    FullSimplify: build full symbolic matrix then FS each pair.
    ================================================================ *)
 
-printSection["Step 7: Detailed balance (" <> If[useFS,"FullSimplify","SZPure direct"] <> ")"];
-t7 = AbsoluteTime[];
+printSection["Step 8: Detailed balance (" <> If[useFS,"FullSimplify","SZPure direct"] <> ")"];
+t8 = AbsoluteTime[];
 
 If[useFS,
-  (* FS path: needs symbolic T matrix *)
   fullMatrix = $dbcExpandOrbitsToMatrix[repLeaves, repToOrbitMap, nGrid];
   Print["  T-matrix entries : ", Length[fullMatrix]];
   symEnergyFn = Function[st, Block[{$nGrid=nGrid}, energy[st] /. r_Real :> Rationalize[r]]];
@@ -237,13 +271,12 @@ If[useFS,
     fullMatrix, allStates, symEnergyFn, extraAssumptions,
     "FullSimplify"->True, "SZRepeats"->szRepeats],
 
-  (* SZPure fast path: numerical leaf evaluation *)
   violations = $dbcSZCheckLeaves[
     repLeaves, repToOrbitMap,
     Function[st, Block[{$nGrid=nGrid}, energy[st]]],
     allStates, nGrid, symCouplings, szRepeats]];
 
-Print["  Time: ", Round[AbsoluteTime[]-t7, 0.01], "s"];
+Print["  Time: ", Round[AbsoluteTime[]-t8, 0.01], "s"];
 If[violations === {},
   Print["  PASS  — detailed balance satisfied for all ", Length[allStates], " states"],
   Print["  FAIL  — ", Length[violations], " violation(s):"];
@@ -263,14 +296,21 @@ Print["  SUMMARY"];
 Print[sep];
 Print["  Translational : ", If[wantTrans,
   If[tauResult["tauFree"],"PASS (algebraic)","FAIL"],
-  "not checked"]];
+  If[MemberQ[symGroup,"translation"],"FAIL (recomputed without)","not checked"]]];
 Print["  D4 rotational : ", If[wantD4,
   If[d4Result["d4Pass"],"PASS","FAIL"],
   "not checked"]];
-Print["  Ergodicity    : ", If[ergResult["ergodic"],"PASS","FAIL"],
-      " (", ergResult["found"], "/", ergResult["theoretical"], " states)"];
+Print["  State count   : ", If[ergCount["ergodic"],"OK","MISMATCH"],
+      " (", ergCount["found"], "/", ergCount["theoretical"], ")"];
+Print["  Ergodicity    : ", If[ergoResult["ergodic"],"PASS","FAIL"],
+      " (", ergoResult["reached"], "/", ergoResult["total"], " reachable)"];
 Print["  Detailed bal. : ", If[violations==={},"PASS","FAIL"]];
 Print[sep];
 
-If[violations==={}&&(d4Result["d4Pass"])&&(tauResult["tauFree"]===True||!wantTrans),
-  Exit[0], Exit[1]]
+allPassed = (violations === {} &&
+  d4Result["d4Pass"] &&
+  (tauResult["tauFree"] === True || !MemberQ[symGroup, "translation"]) &&
+  ergoResult["ergodic"] &&
+  ergCount["ergodic"]);
+
+If[allPassed, Exit[0], Exit[1]]
