@@ -365,7 +365,6 @@ RunWithBitsAT[alg_, state_, bits_List] :=
 $dbcBuildStateLeaves[state_, alg_, maxDepth_Integer, tlim_,
                      nGrid_Integer, normFn_] :=
   Module[{queue = {{}}, leaves = {}, t0 = AbsoluteTime[], timedOut = False,
-          droppedPaths = 0,
           bits, res, ns, w},
     $dbcCurrentNGrid = nGrid;
     While[queue =!= {} && !timedOut,
@@ -376,7 +375,15 @@ $dbcBuildStateLeaves[state_, alg_, maxDepth_Integer, tlim_,
         res === $OutOfBits && Length[bits] < maxDepth,
           queue = Join[queue, {Append[bits,0], Append[bits,1]}],
         res === $OutOfBits,
-          droppedPaths++,
+          (* A BFS path reached maxDepth without the algorithm terminating.
+             This means transitions exist that are not captured — the DB check
+             would silently operate on an incomplete transition matrix.
+             This is a hard error: increase -maxDepth to cover all paths. *)
+          Return[$dbc$cantHandle[
+            "BFS incomplete: a random-number path reached maxDepth=" <>
+            ToString[maxDepth] <> " before the algorithm returned a state. " <>
+            "Increase -maxDepth (current: " <> ToString[maxDepth] <>
+            ") to ensure all transitions are covered."], Module],
         res === $dbc$outOfRange,
           Null,
         MatchQ[res,$dbc$cantHandle[_]],
@@ -385,54 +392,9 @@ $dbcBuildStateLeaves[state_, alg_, maxDepth_Integer, tlim_,
           {ns, w} = res;
           AppendTo[leaves, {bits, normFn[ns], w}]]];
     If[timedOut, Print["  WARNING: time limit reached for state ", state]];
-    If[droppedPaths > 0,
-      Print["  WARNING: ", droppedPaths, " path(s) hit maxDepth=", maxDepth,
-            " and were dropped for state ", Short[state],
-            ". Increase -maxDepth if the algorithm uses long random sequences."]];
     leaves]
 
 
-(* ----------------------------------------------------------------
-   BuildTreeAT
-   State-space BFS from seedState. Discovers all reachable states.
-   Returns Association[ state → {leaf,...} ] or $dbc$cantHandle[msg].
-   normFn: normalisation applied to every returned state.
-   ---------------------------------------------------------------- *)
-Options[BuildTreeAT] = {"MaxBitDepth"->20, "TimeLimit"->120., "Verbose"->False}
-
-BuildTreeAT[seedState_, alg_, nGrid_Integer, normFn_, OptionsPattern[]] :=
-  Module[{maxDepth = OptionValue["MaxBitDepth"],
-          tlim     = N @ OptionValue["TimeLimit"],
-          verbose  = OptionValue["Verbose"],
-          discovered, toProcess, batch, result, s, leaves, err},
-    $dbcCurrentNGrid = nGrid;
-    discovered = Association[{seedState -> True}];
-    toProcess = {seedState}; result = <||>;
-    While[toProcess =!= {},
-      batch = toProcess; toProcess = {};
-      If[verbose, Print["  BFS wave: ", Length[batch], " states"]];
-      Do[
-        s      = batch[[i]];
-        leaves = $dbcBuildStateLeaves[s, alg, maxDepth, tlim, nGrid, normFn];
-        If[MatchQ[leaves, $dbc$cantHandle[_]], Return[leaves, Module]];
-        result[s] = leaves;
-        Do[
-          If[!KeyExistsQ[discovered, leaf[[2]]],
-            discovered[leaf[[2]]] = True;
-            AppendTo[toProcess, leaf[[2]]]],
-          {leaf, leaves}],
-        {i, Length[batch]}]];
-    result]
-
-(* Build transition matrix from BuildTreeAT output. *)
-TreeATToMatrix[treeData_Association] :=
-  Module[{matrix = <||>},
-    Do[
-      Do[With[{ns=leaf[[2]],w=leaf[[3]]},
-        matrix[{s,ns}] = Lookup[matrix,Key[{s,ns}],0] + w],
-        {leaf, treeData[s]}],
-      {s, Keys[treeData]}];
-    matrix]
 
 
 (* ================================================================
@@ -464,99 +426,8 @@ $dbcCheckTranslational[states_List, alg_, nGrid_Integer,
     <|"tauFree" -> tauFree, "violations" -> Take[violations, UpTo[5]]|>]
 
 
-(* ================================================================
-   SECTION 4b — NUMERICAL EQUALITY HELPER (SZ-style)
-   ================================================================
-   Compares two symbolic expressions at nReps random parameter
-   points drawn from symParams ∪ {β}.  Returns True if they agree
-   at all points (within floating-point tolerance), False otherwise.
-   If either expression fails to evaluate numerically (residual
-   symbols after substitution), returns True (inconclusive = no
-   violation reported) to avoid false D4 failures.
-   ================================================================ *)
-
-$dbcNumericallyEqual[expr1_, expr2_, symParams_List, nReps_:3] :=
-  Module[{assign, v1, v2},
-    AllTrue[
-      Table[
-        assign = Join[
-          Map[# -> N[$szRandQ[]] &, symParams],
-          {\[Beta] -> RandomReal[{0.3, 3.0}]}];
-        v1 = N[expr1 /. assign];
-        v2 = N[expr2 /. assign];
-        If[!NumericQ[v1] || !NumericQ[v2],
-          True,   (* inconclusive — don't report as violation *)
-          Abs[v1 - v2] <= 1*^-7 * Max[Abs[v1], Abs[v2], 1*^-30]],
-        {nReps}],
-      TrueQ]]
 
 
-(* ================================================================
-   SECTION 5 — D4 GENERATOR TESTING
-   ================================================================
-   For each orbit rep s₀, run BFS from rot90(s₀) and reflect(s₀).
-   Compare T(rot90(s₀)→rot90(t)) with T(s₀→t) using SZ-style
-   numerical evaluation (more robust than structural equality ===).
-   By group theory, checking rotation + reflection is sufficient
-   to certify all 8 elements of D4.
-   Returns <|"d4Pass"->True/False, "fails"->{...}|>.
-   ================================================================ *)
-
-$dbcVerifyD4[repLeaves_Association, alg_, nGrid_Integer,
-              maxDepth_Integer, tlim_, symParams_List:{}] :=
-  Module[{normFn = $dbcNormState[#,nGrid]&,
-          reps, d4Pass = True, fails = {},
-          s0, repMatrix,
-          rotState, rotLeaves, rotMatrix, rViol,
-          refState, refLeaves, refMatrix, sViol},
-    reps = Keys[repLeaves];
-    Do[
-      s0 = reps[[ri]];
-      repMatrix = <||>;
-      Do[With[{ns=leaf[[2]],w=leaf[[3]]},
-        repMatrix[{s0,ns}]=Lookup[repMatrix,Key[{s0,ns}],0]+w],
-        {leaf, repLeaves[s0]}];
-
-      (* --- Rotation check --- *)
-      rotState  = $dbcApplyRot90[s0, nGrid];
-      rotLeaves = $dbcBuildStateLeaves[rotState,alg,maxDepth,tlim,nGrid,normFn];
-      If[MatchQ[rotLeaves,$dbc$cantHandle[_]],
-        AppendTo[fails,<|"rep"->s0,"gen"->"rot90","error"->rotLeaves[[1]]|>];
-        d4Pass=False; Continue[]];
-      rotMatrix = <||>;
-      Do[With[{ns=leaf[[2]],w=leaf[[3]]},
-        rotMatrix[{rotState,ns}]=Lookup[rotMatrix,Key[{rotState,ns}],0]+w],
-        {leaf,rotLeaves}];
-      rViol = None;
-      KeyValueMap[Function[{pair,tVal},
-        With[{dest=pair[[2]],rotDest=$dbcApplyRot90[pair[[2]],nGrid]},
-          With[{tRot=Lookup[rotMatrix,Key[{rotState,rotDest}],0]},
-            If[!$dbcNumericallyEqual[tVal, tRot, symParams],
-              rViol=<|"rep"->s0,"dest"->dest,"T(rep)"->tVal,"T(rot)"->tRot|>]]]],
-        repMatrix];
-      If[rViol=!=None, AppendTo[fails,<|"gen"->"rot90","mismatch"->rViol|>]; d4Pass=False];
-
-      (* --- Reflection check --- *)
-      refState  = $dbcApplyReflect[s0, nGrid];
-      refLeaves = $dbcBuildStateLeaves[refState,alg,maxDepth,tlim,nGrid,normFn];
-      If[MatchQ[refLeaves,$dbc$cantHandle[_]],
-        AppendTo[fails,<|"rep"->s0,"gen"->"reflect","error"->refLeaves[[1]]|>];
-        d4Pass=False; Continue[]];
-      refMatrix = <||>;
-      Do[With[{ns=leaf[[2]],w=leaf[[3]]},
-        refMatrix[{refState,ns}]=Lookup[refMatrix,Key[{refState,ns}],0]+w],
-        {leaf,refLeaves}];
-      sViol = None;
-      KeyValueMap[Function[{pair,tVal},
-        With[{dest=pair[[2]],refDest=$dbcApplyReflect[pair[[2]],nGrid]},
-          With[{tRef=Lookup[refMatrix,Key[{refState,refDest}],0]},
-            If[!$dbcNumericallyEqual[tVal, tRef, symParams],
-              sViol=<|"rep"->s0,"dest"->dest,"T(rep)"->tVal,"T(ref)"->tRef|>]]]],
-        repMatrix];
-      If[sViol=!=None, AppendTo[fails,<|"gen"->"reflect","mismatch"->sViol|>]; d4Pass=False],
-
-      {ri, Length[reps]}];
-    <|"d4Pass"->d4Pass, "fails"->fails|>]
 
 
 (* ================================================================
@@ -752,12 +623,12 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
                    energy_, allStates_List, nGrid_Integer,
                    symParams_List, nReps_Integer,
                    tol_:1*^-7] :=
-  Module[{violations = {}, betaVal, assign,
+  Module[{violations = <||>, done = False, betaVal, assign,
           nStates, stateToIdx, energyExprs,
           allGKeys, gIdxOf, gActI,
           repList, repOrbitPairs,
-          wVals, rowT, pairs, pairsArr,
-          betaArr, lhs, rhs, ei, ej},
+          wVals, rowT, pairsArr,
+          betaArr, tij, tji, lhs, rhs, ei, ej},
 
     nStates    = Length[allStates];
     stateToIdx = AssociationThread[allStates -> Range[nStates]];
@@ -792,6 +663,7 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
     pairsArr = Select[pairsArr, #[[1]] =!= #[[2]] &];
 
     Do[
+      If[done, Break[]];
       betaVal = RandomReal[{0.3, 5.0}];
       assign  = Join[
         Map[# -> N[$szRandQ[]] &, symParams],
@@ -821,15 +693,15 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
             lhs = tij * Exp[-betaVal * ei];
             rhs = tji * Exp[-betaVal * ej];
             If[Abs[lhs - rhs] > tol * Max[Abs[lhs], Abs[rhs], 1*^-30],
-              AppendTo[violations,
-                <|"pair" -> {allStates[[i]], allStates[[j]]},
-                  "tij"  -> tij, "tji"  -> tji,
-                  "ei"   -> ei,  "ej"   -> ej,
-                  "beta" -> betaVal,
-                  "lhs"  -> lhs, "rhs"  -> rhs|>]]]],
+              If[!KeyExistsQ[violations, pair],
+                violations[pair] = <|"pair" -> {allStates[[i]], allStates[[j]]},
+                                     "tij"  -> tij, "tji"  -> tji,
+                                     "ei"   -> ei,  "ej"   -> ej,
+                                     "beta" -> betaVal|>];
+              If[Length[violations] >= 10, done = True; Break[]]]]],
         {pair, pairsArr}],
     {nReps}];
-    violations]
+    Values[violations]]
 
 
 (* ================================================================

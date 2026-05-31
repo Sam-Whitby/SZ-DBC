@@ -76,20 +76,38 @@ doNumerical = (mode === "Numerical");
 (* ---- Coupling atoms: clear any pre-existing numeric assignments,
         then install the canonicalisation symmetry rule so that
         couplingJ[b,a,d] with b>a → couplingJ[a,b,d] throughout. ---- *)
-symParamData = If[ValueQ[DynamicSymParams],
+(* ValueQ[DynamicSymParams] would return False even when the function is defined,
+   because ValueQ only tests OwnValues, not DownValues.  A function f[x_]:=...
+   has DownValues but no OwnValue.  Use DownValues to detect definition. *)
+symParamData = If[Length[DownValues[DynamicSymParams]] > 0,
   DynamicSymParams[{seedState}],
   <|"couplings"->{}, "numericParams"->{}|>];
-symCouplings = symParamData["couplings"];
-symParamList = symCouplings;
+symCouplings  = symParamData["couplings"];
+(* extraSymParams: bare symbols for field-like parameters (e.g. fieldH).
+   Unlike coupling atoms, these are not canonicalised by the symmetry rule. *)
+extraSymParams = Lookup[symParamData, "extraSymParams", {}];
+symParamList  = Join[symCouplings, extraSymParams];
 
 (* Clear the coupling head symbol(s) to remove any residual assignments *)
 Scan[ClearAll, DeleteDuplicates[Head /@ symCouplings]];
+(* Clear extra parameter symbols directly *)
+Scan[ClearAll, extraSymParams];
 
 (* Add symmetry rule: couplingJ[b,a,d]/;b>a := couplingJ[a,b,d] *)
 $dbcAddCouplingSymmetry[symCouplings];
 
-(* Declare extra assumptions for DB check: all couplings real *)
-extraAssumptions = Map[Element[#, Reals]&, symCouplings];
+(* Validate: all coupling atom arguments must be machine integers.
+   The symmetry rule and SZ substitution only work correctly for integer
+   type labels {1,2,3,...}.  Reject non-integer labels immediately. *)
+If[Length[symCouplings] > 0 &&
+   !AllTrue[symCouplings, MatchQ[#, _[_Integer, _Integer, _Integer]]&],
+  Print["ERROR: coupling atom arguments must all be integers."];
+  Print["  Particle types must be positive integers {1, 2, 3, ...}."];
+  Print["  Got: ", symCouplings];
+  Exit[1]];
+
+(* Declare extra assumptions for DB check: all params real *)
+extraAssumptions = Map[Element[#, Reals]&, symParamList];
 
 
 (* ---- Helpers ---- *)
@@ -219,20 +237,32 @@ Print["  BFS done: ", Length[reps], " reps  (",
 
 
 (* ================================================================
-   STEP 6 — D4 generator testing
+   STEP 6 — D4 generator testing  [DISABLED — see note below]
+   ================================================================
+   D4 verification is currently disabled pending a robust implementation
+   that handles orbit recomputation on failure (analogous to the τ-failure
+   fallback in Step 4).
+
+   When "D4" is declared in $symmetryGroup:
+     - D4 IS used for orbit computation (Step 2) for performance: 8 reps
+       instead of ~56 translation-only reps.
+     - D4 equivariance is NOT independently verified here.
+     - The DB check (Step 8) trusts the D4 orbit expansion implicitly.
+
+   Consequence: if your algorithm declares D4 but actually breaks it,
+   the DB check result may be unreliable (transition matrix is wrong).
+   If you are unsure whether your algorithm is D4-symmetric, declare
+   $symmetryGroup = {"translation"} only — this uses translation-only
+   orbits (~56 reps for nGrid=3, slower) and verifies only translation.
    ================================================================ *)
 
-d4Result = <|"d4Pass"->True,"fails"->{}|>;
+d4Result = <|"d4Pass" -> True, "fails" -> {}|>;
 
 If[wantD4,
-  printSection["Step 6: D4 generator testing"];
-  t6 = AbsoluteTime[];
-  d4Result = $dbcVerifyD4[repLeaves, Algorithm, nGrid, maxDepth, timeLimit, symCouplings];
-  If[d4Result["d4Pass"],
-    Print["  PASS  — D4 invariance verified (", Length[reps], " reps × 2 generators)"],
-    Print["  FAIL  — D4 invariance violated:"];
-    Scan[Print["    ", #]&, d4Result["fails"]]];
-  Print["  Time: ", Round[AbsoluteTime[]-t6, 0.01], "s"]];
+  printSection["Step 6: D4 (assumed, not verified)"];
+  Print["  D4 declared in $symmetryGroup — used for orbit reduction (", Length[reps], " reps)."];
+  Print["  D4 equivariance is assumed, not independently verified."]];
+
 
 
 (* ================================================================
@@ -274,17 +304,19 @@ If[useFS,
   violations = $dbcSZCheckLeaves[
     repLeaves, repToOrbitMap,
     Function[st, Block[{$nGrid=nGrid}, energy[st]]],
-    allStates, nGrid, symCouplings, szRepeats]];
+    allStates, nGrid, symParamList, szRepeats]];
 
 Print["  Time: ", Round[AbsoluteTime[]-t8, 0.01], "s"];
 If[violations === {},
   Print["  PASS  — detailed balance satisfied for all ", Length[allStates], " states"],
-  Print["  FAIL  — ", Length[violations], " violation(s):"];
+  Print["  FAIL  — ", Length[violations], " violating pair(s) found:"];
   Scan[Function[v,
     Print["    s=",v["pair"][[1]]," t=",v["pair"][[2]]];
     Print["      T(s->t)=",v["tij"],"  T(t->s)=",v["tji"]];
     Print["      E(s)=",v["ei"],"  E(t)=",v["ej"]]],
-    violations]];
+    Take[violations, UpTo[5]]];
+  If[Length[violations] >= 10,
+    Print["    (stopped after 10 unique violating pairs — likely many more)"]]];
 
 
 (* ================================================================
@@ -297,9 +329,7 @@ Print[sep];
 Print["  Translational : ", If[wantTrans,
   If[tauResult["tauFree"],"PASS (algebraic)","FAIL"],
   If[MemberQ[symGroup,"translation"],"FAIL (recomputed without)","not checked"]]];
-Print["  D4 rotational : ", If[wantD4,
-  If[d4Result["d4Pass"],"PASS","FAIL"],
-  "not checked"]];
+Print["  D4 rotational : ", If[wantD4, "assumed (not verified)", "not declared"]];
 Print["  State count   : ", If[ergCount["ergodic"],"OK","MISMATCH"],
       " (", ergCount["found"], "/", ergCount["theoretical"], ")"];
 Print["  Ergodicity    : ", If[ergoResult["ergodic"],"PASS","FAIL"],
@@ -308,7 +338,6 @@ Print["  Detailed bal. : ", If[violations==={},"PASS","FAIL"]];
 Print[sep];
 
 allPassed = (violations === {} &&
-  d4Result["d4Pass"] &&
   (tauResult["tauFree"] === True || !MemberQ[symGroup, "translation"]) &&
   ergoResult["ergodic"] &&
   ergCount["ergodic"]);

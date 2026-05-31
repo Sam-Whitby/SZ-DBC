@@ -39,7 +39,7 @@ $particleTypes  = {1, 2, 3};    (* type multiset for this component check *)
 $seedState = Module[{pos = Flatten[Table[{r,c},{r,$nGrid},{c,$nGrid}],1], types = Sort[$particleTypes]},
   SortBy[MapThread[{#1,#2}&, {Take[pos, Length[types]], types}], First]];
 
-$symmetryGroup = {"translation", "D4"};
+$symmetryGroup = {"translation"};   (* D4 not assumed — verified separately if needed *)
 
 $checkerAbstractParams = {"physLen", "epsLJ"};
 
