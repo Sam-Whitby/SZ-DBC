@@ -104,7 +104,10 @@ $dbcApplyGElem[<|"rot"->ri_, "dr"->dr_, "dc"->dc_|>, state_List, nGrid_Integer] 
 
 $dbcAllGElems[nGrid_Integer, symGroup_List] :=
   Module[{rotIdxs, drDcs},
-    rotIdxs = If[MemberQ[symGroup, "D4"], Range[0,7], {0}];
+    rotIdxs = Which[
+      MemberQ[symGroup, "D4"], Range[0, 7],
+      MemberQ[symGroup, "C4"], Range[0, 3],
+      True, {0}];
     drDcs   = If[MemberQ[symGroup, "translation"],
       Flatten[Table[{dr,dc},{dr,0,nGrid-1},{dc,0,nGrid-1}],1],
       {{0,0}}];
@@ -140,12 +143,21 @@ $dbcComputeOrbits[allStates_List, allGElems_List, nGrid_Integer] :=
           unvisited = Delete[unvisited, Key[ip[[1]]]]],
         imgPairs];
       AppendTo[reps, minImg];
-      orbitMap = <||>;
-      Scan[Function[ip,
-          With[{img=ip[[1]], g=ip[[2]]},
-            If[KeyExistsQ[stateSet,img] && !KeyExistsQ[orbitMap,img],
-              orbitMap[img] = g]]],
-        imgPairs];
+      (* Build orbit map using group elements relative to the CANONICAL
+         REP (minImg), not relative to s.  When s ≠ minImg (always true
+         for D4 since the canonical rep may differ from the first
+         unvisited state), storing g_s where g_s·s = img would cause the
+         orbit expansion to apply g_s to leaf states from the BFS of
+         minImg, producing wrong target positions.  We need h where
+         h·minImg = img.  Recompute imgPairs from minImg to get these. *)
+      With[{imgPairsFromRep =
+              {$dbcApplyGElem[#, minImg, nGrid], #} & /@ allGElems},
+        orbitMap = <||>;
+        Scan[Function[ip,
+            With[{img=ip[[1]], g=ip[[2]]},
+              If[KeyExistsQ[stateSet,img] && !KeyExistsQ[orbitMap,img],
+                orbitMap[img] = g]]],
+          imgPairsFromRep]];
       repToOrbitMap[minImg] = orbitMap];
     {reps, repOfState, repToOrbitMap}]
 
@@ -734,7 +746,7 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
 $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
                    energy_, allStates_List, nGrid_Integer,
                    allSymParams_List,
-                   ebeMaxK_Integer : 12,
+                   ebeMaxK_Integer : 50,
                    szFallbackReps_Integer : 30,
                    tol_ : 1*^-7] :=
   Module[{nStates, stateToIdx, energyExprs,
@@ -742,6 +754,7 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
           pairToLeafSrc,
           allLeaves, allConds, k,
           feasibleRegions, sigma, constraints, jStar,
+          bfsQueue, visitedSigmas, sigma2, constraints2, jStar2,
           violations, done,
           jStarAssign, wVals, leafSrcs, tij, tji, ei, ej, expr, res},
 
@@ -814,9 +827,9 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
         !FreeQ[c, Alternatives @@ allSymParams]]];
     k = Length[allConds];
 
-    Print["  EBE: k=", k, " branch condition(s)  →  2^k=", 2^k, " patterns"];
+    Print["  EBE: k=", k, " branch condition(s)"];
 
-    (* ---- Fallback when k is too large for exhaustive enumeration ---- *)
+    (* ---- Fallback when k is too large ---- *)
     If[k > ebeMaxK,
       Print["  EBE: k=", k, " exceeds ebeMaxK=", ebeMaxK,
             " — falling back to probabilistic SZ (",
@@ -827,26 +840,50 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
                szFallbackReps, tol]]];
 
     (* ============================================================
-       PHASE 2 — Enumerate feasible coupling-constant regions
+       PHASE 2 — Region enumeration via arrangement BFS
+       ============================================================
+       Replaces exhaustive 2^k enumeration with O(T×k) BFS over the
+       hyperplane arrangement adjacency graph, where T is the number
+       of real cells (feasible regions).
+
+       Key guarantee: the d-dimensional cells of any hyperplane
+       arrangement are connected under facet-adjacency (cells sharing a
+       codimension-1 face differ in exactly one sign bit).  Therefore
+       BFS from any starting cell reaches ALL cells, visiting each
+       exactly once.  Total FindInstance calls <= T x k.
        ============================================================ *)
     feasibleRegions = {};
-    Do[
-      sigma = IntegerDigits[pattern, 2, k];
-      (* σ[[i]]=1 → condition i holds (the comparison is True)
-         σ[[i]]=0 → condition i fails (the negation holds)        *)
-      constraints = And @@ Table[
-        If[sigma[[i]] == 1,
-           allConds[[i]],           (* condition True  *)
-           ! allConds[[i]]],        (* condition False *)
-        {i, k}];
-      jStar = Quiet[
-        FindInstance[constraints, allSymParams, Rationals, 1]];
-      If[jStar =!= {} && jStar =!= {{}},
-        AppendTo[feasibleRegions, {sigma, First[jStar]}]],
-      {pattern, 0, 2^k - 1}];
-
-    Print["  EBE: ", Length[feasibleRegions], "/", 2^k,
-          " regions feasible"];
+    If[k == 0 || Length[allSymParams] == 0,
+      (* No Piecewise conditions: single trivial region *)
+      feasibleRegions = {{Table[1, {k}], {}}};
+      Print["  EBE: 1 feasible region (no branch conditions)"],
+      (* BFS over the hyperplane arrangement *)
+      jStar = Quiet[FindInstance[True, allSymParams, Rationals, 1]];
+      If[jStar === {} || jStar === {{}},
+        (* Fallback: shouldn't happen for real coupling constants *)
+        feasibleRegions = {{Table[1, {k}], {}}};
+        Print["  EBE: 1 feasible region (fallback — no rational start found)"],
+        jStar = First[jStar];
+        sigma = Table[If[TrueQ[allConds[[i]] /. jStar], 1, 0], {i, k}];
+        visitedSigmas = <|sigma -> jStar|>;
+        feasibleRegions = {{sigma, jStar}};
+        bfsQueue = {sigma};
+        While[bfsQueue =!= {},
+          sigma = First[bfsQueue]; bfsQueue = Rest[bfsQueue];
+          Do[
+            sigma2 = ReplacePart[sigma, i -> 1 - sigma[[i]]];
+            If[!KeyExistsQ[visitedSigmas, sigma2],
+              constraints2 = And @@ Table[
+                If[sigma2[[j]] == 1, allConds[[j]], !allConds[[j]]], {j, k}];
+              jStar2 = Quiet[FindInstance[constraints2, allSymParams, Rationals, 1]];
+              If[jStar2 =!= {} && jStar2 =!= {{}},
+                visitedSigmas[sigma2] = First[jStar2];
+                AppendTo[feasibleRegions, {sigma2, First[jStar2]}];
+                AppendTo[bfsQueue, sigma2],
+                visitedSigmas[sigma2] = None]],
+            {i, k}]];
+        Print["  EBE: ", Length[feasibleRegions], " feasible region(s)  (",
+              Length[visitedSigmas], " sign patterns visited via BFS)"]]];
 
     (* ============================================================
        PHASE 3 — Exact DB check for each feasible region
@@ -909,6 +946,117 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
       {ri, Length[feasibleRegions]}];
 
     Values[violations]]
+
+
+(* ================================================================
+   SECTION 7d — ROTATIONAL INVARIANCE CHECK (numerical)
+   ================================================================
+   Checks T(s→t) = T(R·s → R·t) for all communicating pairs and
+   each D4 element R in rotIdxsToCheck, using nReps random coupling
+   points (SZ-style).
+
+   rotIdxsToCheck: subset of {1..7}
+     C4 rotations:  1 (rot90CW), 2 (rot180), 3 (rot270CW)
+     Reflections:   4 (LR), 5 (UD), 6 (main diag), 7 (anti-diag)
+
+   repLeaves/repToOrbitMap should be the TRANSLATION-ONLY BFS output
+   (not yet reduced by any rotational symmetry).  The function builds
+   the full T matrix by orbit expansion and checks the symmetry.
+
+   Returns <|"pass" -> True/False, "violations" -> {...}|>.
+   ================================================================ *)
+
+$dbcCheckRotational[repLeaves_Association, repToOrbitMap_Association,
+                     allStates_List, nGrid_Integer, symParams_List,
+                     rotIdxsToCheck_List, nReps_Integer : 5,
+                     tol_ : 1*^-6] :=
+  Module[{nStates, stateToIdx, allGKeys, gIdxOf, gActI,
+          repList, repOrbitPairs, pairsArr,
+          rotAct, betaVal, assign, wVals, rowT,
+          violations = {}, done = False,
+          rsi, rsj, diffFwd, diffRev},
+
+    nStates    = Length[allStates];
+    stateToIdx = AssociationThread[allStates -> Range[nStates]];
+
+    (* G-action table from the translation-only orbit map *)
+    allGKeys = DeleteDuplicates @ Flatten[Values /@ Values[repToOrbitMap], 1];
+    gIdxOf   = AssociationThread[allGKeys -> Range[Length[allGKeys]]];
+    gActI    = Table[0, {Length[allGKeys]}, {nStates}];
+    Do[
+      With[{gi = gIdxOf[g]},
+        Do[gActI[[gi, si]] =
+             stateToIdx[$dbcApplyGElem[g, allStates[[si]], nGrid]],
+           {si, nStates}]],
+      {g, allGKeys}];
+
+    repList = Keys[repLeaves];
+    repOrbitPairs = Table[
+      With[{repKey = repList[[ri]],
+            orbitMap = repToOrbitMap[repList[[ri]]]},
+        Table[
+          With[{tgtIdx = stateToIdx[repLeaves[repKey][[li, 2]]]},
+            Map[Function[sKey,
+                {stateToIdx[sKey],
+                 gActI[[gIdxOf[orbitMap[sKey]], tgtIdx]]}],
+              Keys[orbitMap]]],
+          {li, Length[repLeaves[repKey]]}]],
+      {ri, Length[repList]}];
+
+    pairsArr = DeleteDuplicates @ Sort @ Map[Sort,
+      Flatten[repOrbitPairs, 2]];
+    pairsArr = Select[pairsArr, #[[1]] =!= #[[2]] &];
+
+    (* Rotation action table: rotAct[[ri, si]] = index of R_ri(allStates[[si]]) *)
+    rotAct = Table[
+      With[{g = <|"rot" -> rotIdxsToCheck[[ri]], "dr" -> 0, "dc" -> 0|>},
+        Table[stateToIdx[$dbcApplyGElem[g, allStates[[si]], nGrid]],
+              {si, nStates}]],
+      {ri, Length[rotIdxsToCheck]}];
+
+    Do[
+      If[done, Break[]];
+      betaVal = RandomReal[{0.3, 5.0}];
+      assign  = Join[
+        Map[# -> N[$szRandQ[]] &, symParams],
+        {\[Beta] -> betaVal, numBeta -> betaVal}];
+
+      wVals = Table[
+        N[repLeaves[repList[[ri]]][[All, 3]] /. assign],
+        {ri, Length[repList]}];
+
+      rowT = SparseArray[{}, {nStates, nStates}];
+      Do[
+        Do[
+          With[{w = wVals[[ri, li]]},
+            If[NumericQ[w] && w != 0.,
+              Scan[Function[st, rowT[[st[[1]], st[[2]]]] += w],
+                   repOrbitPairs[[ri, li]]]]],
+          {li, Length[repOrbitPairs[[ri]]]}],
+        {ri, Length[repList]}];
+
+      (* For each communicating pair and each rotation, check symmetry *)
+      Do[
+        If[done, Break[]];
+        With[{i = pair[[1]], j = pair[[2]]},
+          Do[
+            rsi = rotAct[[ri, i]]; rsj = rotAct[[ri, j]];
+            diffFwd = Abs[rowT[[i, j]] - rowT[[rsi, rsj]]];
+            diffRev = Abs[rowT[[j, i]] - rowT[[rsj, rsi]]];
+            If[diffFwd > tol * Max[Abs[rowT[[i, j]]], Abs[rowT[[rsi, rsj]]], 1*^-30] ||
+               diffRev > tol * Max[Abs[rowT[[j, i]]], Abs[rowT[[rsj, rsi]]], 1*^-30],
+              AppendTo[violations,
+                <|"rot"   -> rotIdxsToCheck[[ri]],
+                  "s"     -> allStates[[i]],
+                  "t"     -> allStates[[j]],
+                  "Tst"   -> rowT[[i, j]],
+                  "TRsRt" -> rowT[[rsi, rsj]]|>];
+              If[Length[violations] >= 5, done = True; Break[]]],
+            {ri, Length[rotIdxsToCheck]}]],
+        {pair, pairsArr}],
+    {nReps}];
+
+    <|"pass" -> (violations === {}), "violations" -> violations|>]
 
 
 (* ================================================================

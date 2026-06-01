@@ -27,7 +27,7 @@ $seedState = Module[
    types = Sort[$particleTypes]},
   SortBy[MapThread[{#1, #2} &, {Take[pos, Length[types]], types}], First]];
 
-$symmetryGroup = {"translation"};   (* no D4 assumption *)
+$symmetryGroup = {"translation", "D4"};   (* D4 verified numerically in Step 5b *)
 
 
 (* ---- Geometry ---- *)

@@ -45,7 +45,7 @@ mode       = parseOpt["-mode", "Symbolic"];
 szRepeats  = ToExpression[parseOpt["-szRepeats", "30"]];
 maxDepth   = ToExpression[parseOpt["-maxDepth",  "22"]];
 timeLimit  = ToExpression[parseOpt["-timeLimit", "120"]];
-ebeMaxK    = ToExpression[parseOpt["-ebeMaxK",   "12"]];
+ebeMaxK    = ToExpression[parseOpt["-ebeMaxK",   "50"]];
 verbose    = parseBool["-verbose"];
 
 
@@ -156,8 +156,11 @@ If[!ergCount["ergodic"],
 
 printSection["Step 2: G-orbit computation"];
 t2 = AbsoluteTime[];
-allGElems = $dbcAllGElems[nGrid, symGroup];
-Print["  |G| = ", Length[allGElems]];
+(* Always start with translation-only orbits.  D4/C4 is verified
+   numerically after the BFS (Step 5b) and orbits are recomputed
+   to the verified subgroup before the DB check. *)
+allGElems = $dbcAllGElems[nGrid, Intersection[symGroup, {"translation"}]];
+Print["  |G| (initial) = ", Length[allGElems], " (translation only)"];
 {reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
 Print["  Orbit reps : ", Length[reps], "  (", Round[AbsoluteTime[]-t2,0.01], "s)"];
 
@@ -242,31 +245,87 @@ Print["  BFS done: ", Length[reps], " reps  (",
 
 
 (* ================================================================
-   STEP 6 — D4 generator testing  [DISABLED — see note below]
+   STEP 5b — Rotational invariance check and orbit reduction
    ================================================================
-   D4 verification is currently disabled pending a robust implementation
-   that handles orbit recomputation on failure (analogous to the τ-failure
-   fallback in Step 4).
+   If "D4" is declared in $symmetryGroup AND translation invariance
+   passed, verify D4 numerically using the T matrix built from the
+   translation-only BFS.  If any rotation/reflection passes, recompute
+   orbits with the verified subgroup and rerun BFS from the smaller
+   representative set before the DB check.
 
-   When "D4" is declared in $symmetryGroup:
-     - D4 IS used for orbit computation (Step 2) for performance: 8 reps
-       instead of ~56 translation-only reps.
-     - D4 equivariance is NOT independently verified here.
-     - The DB check (Step 8) trusts the D4 orbit expansion implicitly.
-
-   Consequence: if your algorithm declares D4 but actually breaks it,
-   the DB check result may be unreliable (transition matrix is wrong).
-   If you are unsure whether your algorithm is D4-symmetric, declare
-   $symmetryGroup = {"translation"} only — this uses translation-only
-   orbits (~56 reps for nGrid=3, slower) and verifies only translation.
+   The check is SZ-style: builds T at nReps random coupling points
+   and verifies T(s→t) = T(R·s→R·t) for all communicating pairs.
+   This is reliable in practice; see documentation for discussion of
+   the algebraic vs. numerical trade-off.
    ================================================================ *)
 
-d4Result = <|"d4Pass" -> True, "fails" -> {}|>;
+(* Helper: run BFS from a given rep list, update repLeaves in place *)
+$runBFS[repsIn_List] :=
+  Module[{leavesNew = <||>, errNew = None},
+    Do[
+      With[{sRep = repsIn[[ri]],
+            lv = $dbcBuildStateLeaves[repsIn[[ri]], Algorithm, maxDepth,
+                                       timeLimit, nGrid, normFn]},
+        If[MatchQ[lv, $dbc$cantHandle[_]], errNew = lv[[1]]; Break[]];
+        leavesNew[sRep] = lv],
+      {ri, Length[repsIn]}];
+    {leavesNew, errNew}];
 
-If[wantD4,
-  printSection["Step 6: D4 (assumed, not verified)"];
-  Print["  D4 declared in $symmetryGroup — used for orbit reduction (", Length[reps], " reps)."];
-  Print["  D4 equivariance is assumed, not independently verified."]];
+d4Result = <|"d4Pass" -> False, "label" -> "not checked"|>;
+
+If[wantD4 && tauResult["tauFree"] === True,
+  printSection["Step 5b: Rotational invariance check (D4)"];
+  t5b = AbsoluteTime[];
+  (* nReps scales slightly with number of coupling parameters *)
+  d4CheckReps = Max[5, Min[10, Length[symParamList] + 2]];
+  (* Check all 7 non-identity D4 elements *)
+  rotCheck = $dbcCheckRotational[
+    repLeaves, repToOrbitMap, allStates, nGrid, symParamList,
+    Range[1, 7], d4CheckReps];
+  Print["  Time: ", Round[AbsoluteTime[] - t5b, 0.01], "s"];
+
+  Which[
+    rotCheck["pass"],
+      (* Full D4 verified *)
+      Print["  PASS — full D4 symmetry verified (",
+            d4CheckReps, " random coupling points)"];
+      d4Result = <|"d4Pass" -> True, "label" -> "D4 (verified)"|>;
+      allGElems = $dbcAllGElems[nGrid, symGroup];
+      {reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
+      Print["  |G| = ", Length[allGElems], "  →  ", Length[reps],
+            " orbit reps after D4 reduction"];
+      printSection["Step 5c: BFS from reduced orbit reps (D4)"];
+      tReBFS = AbsoluteTime[];
+      {repLeaves, err} = $runBFS[reps];
+      If[err =!= None, Print["  ERROR in BFS: ", err]; Exit[1]];
+      Print["  BFS done: ", Length[reps], " reps  (",
+            Round[AbsoluteTime[] - tReBFS, 0.01], "s)"],
+
+    (* C4 rotations only? Check elements 1-3 separately *)
+    Select[rotCheck["violations"], #["rot"] <= 3 &] === {},
+      Print["  PASS — C4 (rotations) verified; reflections failed"];
+      Print["  Using C4+translation orbits"];
+      d4Result = <|"d4Pass" -> True, "label" -> "C4 (verified)"|>;
+      allGElems = $dbcAllGElems[nGrid, Union[DeleteCases[symGroup, "D4"], {"C4"}]];
+      {reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
+      Print["  |G| = ", Length[allGElems], "  →  ", Length[reps],
+            " orbit reps after C4 reduction"];
+      printSection["Step 5c: BFS from reduced orbit reps (C4)"];
+      tReBFS = AbsoluteTime[];
+      {repLeaves, err} = $runBFS[reps];
+      If[err =!= None, Print["  ERROR in BFS: ", err]; Exit[1]];
+      Print["  BFS done: ", Length[reps], " reps  (",
+            Round[AbsoluteTime[] - tReBFS, 0.01], "s)"],
+
+    True,
+      (* Neither C4 nor full D4 *)
+      Print["  FAIL — D4 symmetry not verified; keeping translation-only orbits"];
+      d4Result = <|"d4Pass" -> False, "label" -> "FAIL"|>;
+      Scan[Print["    violation: rotElem=", #["rot"],
+                 "  s=", Short[#["s"], 3],
+                 "  T(s,t)=", #["Tst"],
+                 "  T(Rs,Rt)=", #["TRsRt"]] &,
+           Take[rotCheck["violations"], UpTo[3]]]]];
 
 
 
@@ -347,7 +406,10 @@ Print[sep];
 Print["  Translational : ", If[wantTrans,
   If[tauResult["tauFree"],"PASS (algebraic)","FAIL"],
   If[MemberQ[symGroup,"translation"],"FAIL (recomputed without)","not checked"]]];
-Print["  D4 rotational : ", If[wantD4, "assumed (not verified)", "not declared"]];
+Print["  D4 rotational : ", Which[
+  !wantD4, "not declared",
+  d4Result["label"] === "not checked", "declared but not checked (τ failed)",
+  True, d4Result["label"]]];
 Print["  State count   : ", If[ergCount["ergodic"],"OK","MISMATCH"],
       " (", ergCount["found"], "/", ergCount["theoretical"], ")"];
 Print["  Ergodicity    : ", If[ergoResult["ergodic"],"PASS","FAIL"],
