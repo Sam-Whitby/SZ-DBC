@@ -6,10 +6,12 @@
      wolframscript -file check.wls <algorithm-file.wl> [options]
 
    Options:
-     -mode Symbolic    (default) Full symbolic DB check (SZPure)
-     -mode FullSimplify           Use FullSimplify instead of SZ
-     -mode Numerical              Numerical MCMC check only
-     -szRepeats N      SZ random evaluation points (default 30)
+     -mode Symbolic    (default) EBE exact DB check
+     -mode SZPure                Probabilistic SZ check (legacy)
+     -mode FullSimplify          Use FullSimplify instead of EBE
+     -mode Numerical             Numerical MCMC check only
+     -szRepeats N      Random evaluation points for SZ fallback (default 30)
+     -ebeMaxK N        Max branch conditions for EBE; falls back to SZ above (default 12)
      -maxDepth N       Maximum BFS bit depth (default 22)
      -timeLimit T      Per-state time limit in seconds (default 120)
      -verbose          Print extra BFS progress info
@@ -43,6 +45,7 @@ mode       = parseOpt["-mode", "Symbolic"];
 szRepeats  = ToExpression[parseOpt["-szRepeats", "30"]];
 maxDepth   = ToExpression[parseOpt["-maxDepth",  "22"]];
 timeLimit  = ToExpression[parseOpt["-timeLimit", "120"]];
+ebeMaxK    = ToExpression[parseOpt["-ebeMaxK",   "12"]];
 verbose    = parseBool["-verbose"];
 
 
@@ -71,6 +74,8 @@ wantD4      = MemberQ[symGroup, "D4"];
 numBetaVal  = If[ValueQ[numBeta], numBeta, 1.0];
 useFS       = (mode === "FullSimplify");
 doNumerical = (mode === "Numerical");
+(* "Symbolic" and "SZPure" both use the symbolic BFS; Symbolic then
+   applies EBE, SZPure applies the legacy probabilistic check.      *)
 
 
 (* ---- Coupling atoms: clear any pre-existing numeric assignments,
@@ -290,7 +295,10 @@ If[ergoResult["ergodic"],
    FullSimplify: build full symbolic matrix then FS each pair.
    ================================================================ *)
 
-printSection["Step 8: Detailed balance (" <> If[useFS,"FullSimplify","SZPure direct"] <> ")"];
+printSection["Step 8: Detailed balance (" <>
+  Which[useFS, "FullSimplify",
+        mode === "SZPure", "SZPure (probabilistic)",
+        True, "EBE (exact)"] <> ")"];
 t8 = AbsoluteTime[];
 
 If[useFS,
@@ -301,10 +309,20 @@ If[useFS,
     fullMatrix, allStates, symEnergyFn, extraAssumptions,
     "FullSimplify"->True, "SZRepeats"->szRepeats],
 
+If[mode === "SZPure",
   violations = $dbcSZCheckLeaves[
     repLeaves, repToOrbitMap,
     Function[st, Block[{$nGrid=nGrid}, energy[st]]],
-    allStates, nGrid, symParamList, szRepeats]];
+    allStates, nGrid, symParamList, szRepeats],
+
+  (* Default: EBE exact check — enumerates all coupling-constant
+     branch regions and checks DB exactly with $dbcIsExpZero.
+     Falls back to probabilistic SZ when k > ebeMaxK.             *)
+  violations = $dbcEBECheckLeaves[
+    repLeaves, repToOrbitMap,
+    Function[st, Block[{$nGrid=nGrid}, energy[st]]],
+    allStates, nGrid, symParamList,
+    ebeMaxK, szRepeats]]];
 
 Print["  Time: ", Round[AbsoluteTime[]-t8, 0.01], "s"];
 If[violations === {},

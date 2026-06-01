@@ -2,7 +2,7 @@
 
 SZ-DBC automatically verifies that an MCMC algorithm satisfies **detailed balance** — the condition required for the algorithm to correctly sample the Boltzmann distribution. It is designed for lattice Monte Carlo algorithms where particles sit on a grid.
 
-The checker works by constructing a complete **symbolic transition matrix** (intercepting all random-number calls during a BFS), verifying **translational invariance algebraically**, checking **ergodicity** via reachability, and then testing **detailed balance** using a Schwartz-Zippel probabilistic evaluation. All steps except the final SZ evaluation are exact.
+The checker works by constructing a complete **symbolic transition matrix** (intercepting all random-number calls during a BFS), verifying **translational invariance algebraically**, checking **ergodicity** via reachability, and then testing **detailed balance** using Exhaustive Branch Enumeration (EBE) — an exact method that systematically covers all coupling-constant parameter regions. For algorithms where EBE is infeasible (many branch conditions), it falls back to a probabilistic Schwartz-Zippel evaluation.
 
 ---
 
@@ -76,16 +76,31 @@ After the orbit-rep BFS is complete, the checker derives the full transition gra
 
 Note that an algorithm can satisfy detailed balance but fail ergodicity — the two conditions are independent. Kawasaki exchange dynamics, for example, satisfies detailed balance but never moves particles, so only the `N! = 6` type-permutation states of the seed positions are reachable from the seed.
 
-### Step 6 — Detailed balance check (Schwartz-Zippel)
+### Step 6 — Detailed balance check (EBE exact / SZ probabilistic)
 
-The checker evaluates the detailed balance condition numerically at 30 randomly chosen parameter points `{β, J₁, J₂, ...}`.
+This is the heart of the checker. The key challenge is that the symbolic leaf weights contain `Piecewise` expressions: the leaf weight of a cluster move, for example, is non-zero only when certain coupling-constant inequalities hold (e.g., the energy increases when the cluster moves, so the link bond is active). Different parameter regions give genuinely different transition matrices, and a DB violation might only manifest in a specific region.
 
-For each evaluation point:
-1. All symbolic leaf weights are evaluated to floating-point numbers. The Piecewise conditions (e.g., `J₁ < J₂`) become concrete comparisons once coupling values are substituted, so every weight collapses to a float.
-2. The full transition matrix for all states is assembled in a single pass via a precomputed G-action integer table — no per-evaluation symbolic operations.
-3. The condition `T(s→t) · exp(-β E(s)) = T(t→s) · exp(-β E(t))` is checked numerically for every communicating pair.
+#### Exhaustive Branch Enumeration (EBE) — the default
 
-**Why this is sound:** for a correct algorithm, the detailed balance expression is algebraically zero as a function of the parameters. After substituting any random coupling values (which resolves all Piecewise branches), the remaining expression in β involves only products of matching exponentials that cancel exactly, giving floating-point zero to machine precision (~10⁻¹⁶). The checker tests against tolerance 10⁻⁷, giving nine orders of magnitude of safety margin. For an incorrect algorithm, the residual expression is a non-zero function of the parameters, and a random evaluation reliably detects it.
+**Phase 1 — Condition extraction.** After the BFS, the checker scans all symbolic leaf weights and collects the `k` distinct Piecewise branch conditions. Each condition is a comparison involving coupling-constant atoms (e.g., `couplingJ[1,2,1] - couplingJ[1,2,2] < 0`). These are the boundaries between parameter regions where different leaves contribute to the transition matrix.
+
+**Phase 2 — Region enumeration.** The checker enumerates all `2^k` sign patterns σ ∈ {0,1}^k, where σᵢ = 1 means condition `i` holds (the comparison is True) and σᵢ = 0 means it does not. For each pattern, it solves a small LP (`FindInstance` over ℚ) to find a rational coupling point `J*(σ)` inside that region — or declares the region infeasible (empty). Many patterns are infeasible due to logical constraints between the conditions.
+
+**Phase 3 — Exact DB check per region.** For each feasible region with coupling point `J*`:
+1. Substitute `J*` into every leaf weight. All `Piecewise` conditions become concrete `True`/`False` rational comparisons and auto-simplify. β remains symbolic.
+2. Build the T matrix for this region.
+3. For each communicating pair (s, t): form `T(s→t)·Exp[-β·E(s)] - T(t→s)·Exp[-β·E(t)]`.
+4. Check this expression exactly using `$dbcIsExpZero`: group terms by the rational exponent coefficient of β, and verify that all rational coefficient sums are zero.
+
+If every feasible region passes: **exact PASS certificate** — detailed balance holds for every possible coupling-constant configuration. If any region fails: **exact FAIL** with the specific coupling values as a counter-example.
+
+**EBE is used when `k ≤ ebeMaxK` (default: 12).** The number of feasible regions is typically much smaller than `2^k` due to feasibility constraints; for example, VMMC on a 3×3 grid has k=12 and only 512/4096 feasible regions.
+
+#### SZ probabilistic fallback (k > ebeMaxK)
+
+When `k > ebeMaxK`, the checker falls back to probabilistic Schwartz-Zippel evaluation: substitute 30 random rational-valued coupling points and check each with tolerance `10⁻⁷`. For algorithms like standard Metropolis (k=18), any violation would appear across essentially all coupling regions, so the probabilistic check is highly reliable despite not being exhaustive.
+
+**Why EBE is strictly better than SZ for small k:** With 30 random points and k=12 conditions, the probability of never sampling a specific rare region is `(1 - 1/4096)^30 ≈ 99.3%`. EBE eliminates this gap entirely. For k=18 (Metropolis), violations manifest across all regions, so SZ is reliable in practice even without exhaustive coverage.
 
 The checker reports at most **10 unique violating pairs** and stops early as soon as 10 are found, making it fast even for severely broken algorithms.
 
@@ -96,7 +111,7 @@ The checker reports at most **10 unique violating pairs** and stops early as soo
 | File | Purpose |
 |------|---------|
 | `check.wls` | Command-line entry point |
-| `dbc_core.wl` | Core library: BFS engine, orbit computation, τ-check, ergodicity, SZ check |
+| `dbc_core.wl` | Core library: BFS engine, orbit computation, τ-check, ergodicity, EBE/SZ check |
 | `examples/single_metropolis.wl` | Metropolis on 2D lattice — **PASS** |
 | `examples/kawasaki.wl` | Kawasaki exchange dynamics — **DB PASS, ERGODICITY FAIL** (by design) |
 | `examples/quadratic_field.wl` | Metropolis with non-translation-invariant energy — **τ FAIL, DB PASS** |
@@ -122,41 +137,64 @@ wolframscript -file check.wls examples/single_metropolis.wl
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-mode Symbolic` | default | SZ probabilistic check |
-| `-mode FullSimplify` | — | Exact symbolic check via FullSimplify (slow) |
+| `-mode Symbolic` | default | EBE exact check (falls back to SZ when k > ebeMaxK) |
+| `-mode SZPure` | — | Probabilistic SZ check (legacy, faster for large k) |
+| `-mode FullSimplify` | — | Exact symbolic check via FullSimplify (very slow) |
 | `-mode Numerical` | — | Numerical MCMC sampling (requires concrete coupling values) |
-| `-szRepeats N` | 30 | Number of SZ evaluation points |
+| `-ebeMaxK N` | 12 | Max branch conditions for EBE; falls back to SZ above this |
+| `-szRepeats N` | 30 | Number of SZ evaluation points (used for fallback) |
 | `-maxDepth N` | 22 | Maximum BFS bit depth per path |
+| `-timeLimit T` | 120 | Per-state time limit in seconds |
 | `-verbose` | off | Print BFS progress per rep |
 
 ### Expected outputs for all examples
 
-**`single_metropolis.wl`** — correct algorithm:
+**`single_metropolis.wl`** — correct algorithm (k=18, SZ fallback):
 ```
 Translational : PASS (algebraic)
 Ergodicity    : PASS (504/504 reachable)
 Detailed bal. : PASS
 ```
 
-**`kawasaki.wl`** — correct algorithm, non-ergodic by design:
+**`kawasaki.wl`** — correct algorithm, non-ergodic by design (k=6, EBE exact):
 ```
 Translational : PASS (algebraic)
 Ergodicity    : FAIL (6/504 reachable)   ← positions never change; expected
 Detailed bal. : PASS
 ```
 
-**`quadratic_field.wl`** — correct algorithm with non-translation-invariant energy:
+**`quadratic_field.wl`** — correct algorithm with non-translation-invariant energy (k=6, EBE exact):
 ```
 Translational : FAIL (recomputed without)   ← field breaks τ-invariance; expected
 Ergodicity    : PASS (12/12 reachable)
 Detailed bal. : PASS
 ```
 
-**`broken_biased_direction.wl`**, **`broken_metropolis_halfbeta.wl`**, **`broken_field_wrong_accept.wl`** — intentionally broken:
+**`broken_biased_direction.wl`**, **`broken_metropolis_halfbeta.wl`** — broken (k=18, SZ fallback):
 ```
 Translational : PASS (algebraic)
 Detailed bal. : FAIL   ← detected correctly
 ```
+
+**`broken_field_wrong_accept.wl`** — broken (k=2, EBE exact):
+```
+Translational : PASS (algebraic)
+Detailed bal. : FAIL   ← detected exactly in 3/4 feasible regions
+```
+
+### Timings (nGrid=3 unless noted, translation-only, Apple M-class CPU)
+
+| Example | k | Regions | DB check time | Mode |
+|---|---|---|---|---|
+| `single_metropolis.wl` | 18 | — (fallback) | ~11s | SZ |
+| `kawasaki.wl` | 6 | 13/64 | ~0.8s | EBE exact |
+| `quadratic_field.wl` (nGrid=2) | 6 | 13/64 | ~0.2s | EBE exact |
+| `broken_field_wrong_accept.wl` (nGrid=2) | 2 | 3/4 | ~0.03s | EBE exact |
+| `broken_biased_direction.wl` | 18 | — (fallback) | ~1.4s | SZ |
+| `broken_metropolis_halfbeta.wl` | 18 | — (fallback) | ~1.2s | SZ |
+| `vmmc_2d.wl` | 12 | 512/4096 | ~215s | EBE exact |
+
+The `vmmc_2d.wl` timing reflects a full exact check over all 512 feasible coupling-constant regions. Use `-mode SZPure` for a fast probabilistic check (~13s) at the cost of exhaustive coverage.
 
 ---
 
@@ -219,7 +257,7 @@ DynamicSymParams[states_List] :=
     "numericParams"  -> {}|>
 ```
 
-Only list canonical (`a ≤ b`) atoms. The checker substitutes random values for everything in `"couplings"` and `"extraSymParams"` during the SZ evaluation.
+Only list canonical (`a ≤ b`) atoms. The checker substitutes random or rational values for everything in `"couplings"` and `"extraSymParams"` during the DB check.
 
 ### Random number calls supported
 
@@ -241,8 +279,8 @@ Any call not on this list causes the BFS to return `$dbc$cantHandle[msg]` and th
 
 ## Known limitations
 
-**1. SZ check is probabilistic, not exact.**
-With 30 evaluation points, the probability of a false negative (declaring a broken algorithm correct) is negligible in practice. Use `-mode FullSimplify` for an exact certificate (much slower; can take hours for complex algorithms).
+**1. EBE is exact for k ≤ ebeMaxK; SZ is probabilistic above.**
+With 30 SZ evaluation points, the probability of a false negative is negligible for Metropolis-type algorithms where any violation manifests across all coupling regions. For cluster algorithms (small k), EBE gives an exact certificate. Use `-mode FullSimplify` for an exact certificate at any k (much slower; can take hours for complex algorithms).
 
 **2. D4 equivariance is assumed, not verified.**
 Declaring `"D4"` in `$symmetryGroup` reduces orbit computation cost significantly (8 representatives instead of 56 for `nGrid=3`) but equivariance is not independently checked. An algorithm that declares D4 but breaks it will produce a wrong transition matrix and potentially a spurious PASS. Declare only `"translation"` if unsure.
@@ -255,6 +293,9 @@ See the notes above. Failure to normalise is silently wrong — it causes incorr
 
 **5. `maxDepth` limits path length.**
 If an algorithm draws more than `maxDepth` (default 22) random bits before returning, the checker reports a hard error. Increase `-maxDepth` for algorithms with long random-number sequences.
+
+**6. EBE timing grows with k.**
+For k=12 (VMMC), EBE tests 512 feasible regions and takes ~215s. For k > 12, the checker automatically falls back to 30-point SZ. Use `-ebeMaxK 8` to force SZ fallback at smaller k if runtime is a concern, or `-ebeMaxK 20` to attempt exact EBE for larger k (may be slow).
 
 ---
 
@@ -270,13 +311,15 @@ check.wls
   ├─ Step 4: $dbcBuildStateLeaves × |orbit reps| → repLeaves (symbolic)
   ├─ Step 5: $dbcCheckErgodicityFromLeaves
   │            └─ BFS on derived transition graph
-  └─ Step 6: $dbcSZCheckLeaves (fast numerical SZ)
-               ├─ Precompute G-action integer table (once)
-               ├─ For each of 30 SZ points:
-               │    ├─ Evaluate leaf weights numerically (resolve Piecewise)
-               │    ├─ Assemble SparseArray T matrix via G-table
-               │    └─ Check T(s→t)·exp(-β E(s)) = T(t→s)·exp(-β E(t)) per pair
-               └─ Report up to 10 unique violating pairs, stop early
+  └─ Step 6: $dbcEBECheckLeaves (default) or $dbcSZCheckLeaves (fallback)
+               │
+               ├─ Phase 1: Extract k distinct Piecewise conditions
+               ├─ Phase 2: Enumerate 2^k sign patterns, LP feasibility (FindInstance)
+               └─ Phase 3: For each feasible region:
+                    ├─ Substitute rational J* into leaf weights (Piecewise auto-resolves)
+                    ├─ Assemble T matrix via precomputed G-action table
+                    └─ Check T(s→t)·exp(-β E(s)) = T(t→s)·exp(-β E(t)) per pair
+                         └─ $dbcIsExpZero: exact rational arithmetic, no floating point
 
 dbc_core.wl
   ├─ SECTION 0:  State format utilities
@@ -288,8 +331,21 @@ dbc_core.wl
   ├─ SECTION 6:  Ergodicity checks (CheckErgodicity, $dbcCheckErgodicityFromLeaves)
   ├─ SECTION 7:  Schwartz-Zippel DB check ($dbcSZCheckOne, CheckDetailedBalanceSZ)
   ├─ SECTION 7b: Direct SZ check from leaves ($dbcSZCheckLeaves)
+  ├─ SECTION 7c: EBE exact check from leaves ($dbcEBECheckLeaves)
   └─ SECTION 8:  Numerical MCMC check (RunNumericalMCMCAT, BoltzmannWeightsAT)
 ```
+
+### How EBE differs from the previous SZ check
+
+The previous default (`$dbcSZCheckLeaves`) evaluated leaf weights at 30 **random** floating-point coupling points and checked DB with a tolerance of `10⁻⁷`. This was probabilistic: with k=12 conditions, each feasible region has probability ~1/512 of being sampled, and any specific region was only tested with probability 1-(511/512)³⁰ ≈ 5.7%.
+
+The new default (`$dbcEBECheckLeaves`) instead:
+1. Discovers all `k` Piecewise conditions symbolically (Phase 1)
+2. Finds a **rational** representative point `J*` for **every** feasible region (Phase 2)
+3. Evaluates leaf weights exactly at `J*` (β stays symbolic; all Piecewise resolve to exact True/False)
+4. Checks the DB expression with `$dbcIsExpZero` — pure rational arithmetic, no floating point
+
+The result is a provably exact certificate: if EBE reports PASS, detailed balance holds for every possible coupling-constant configuration. The SZ check is retained as a fast fallback for large-k algorithms.
 
 ### Timings (nGrid=3, 3 distinguishable particles, translation-only, Apple M-class CPU)
 
@@ -300,5 +356,6 @@ dbc_core.wl
 | τ-BFS from orbit reps | ~3 s | algebraic τ-freedom check |
 | BFS from orbit reps | ~3 s | build symbolic leaf tree |
 | Ergodicity check | ~1 s | reachability BFS on derived graph |
-| SZ DB check | ~10 s | 30 evaluations × 10,000 pairs |
-| **Total** | **~20 s** | |
+| EBE DB check (k=6, 13 regions) | ~0.8 s | kawasaki / quadratic_field |
+| EBE DB check (k=12, 512 regions) | ~215 s | vmmc_2d |
+| SZ DB check (k=18 fallback, 30 pts) | ~11 s | single_metropolis |

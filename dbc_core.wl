@@ -705,6 +705,213 @@ $dbcSZCheckLeaves[repLeaves_Association, repToOrbitMap_Association,
 
 
 (* ================================================================
+   SECTION 7c — EBE (EXHAUSTIVE BRANCH ENUMERATION) DB CHECK
+   ================================================================
+   Exact DB verification by covering every coupling-constant branch
+   region in the symbolic leaf weights.
+
+   Phase 1 — Condition extraction (once):
+     Scan all symbolic leaf weights and collect the k distinct
+     Piecewise branch conditions.  Each condition is a comparison
+     involving coupling-constant atoms (e.g. J_{12,1}-J_{12,2} < 0).
+
+   Phase 2 — Region enumeration (once):
+     Enumerate all 2^k sign patterns σ ∈ {0,1}^k.  For each, solve
+     a small LP (FindInstance over Q) to find a rational coupling
+     point J*(σ) in that region, or declare infeasible.
+
+   Phase 3 — Exact DB check per feasible region:
+     For each feasible region, substitute the rational J* into every
+     leaf weight.  Piecewise conditions are now concrete True/False
+     rationals, so every weight collapses to 0 or a concrete
+     rational x Exp[-β x rational] expression.  β stays symbolic.
+     Assemble T, form the DB expression for each communicating pair,
+     and check exactly with $dbcIsExpZero — no floating point.
+
+   Falls back to $dbcSZCheckLeaves when k > ebeMaxK.
+   ================================================================ *)
+
+$dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
+                   energy_, allStates_List, nGrid_Integer,
+                   allSymParams_List,
+                   ebeMaxK_Integer : 12,
+                   szFallbackReps_Integer : 30,
+                   tol_ : 1*^-7] :=
+  Module[{nStates, stateToIdx, energyExprs,
+          allGKeys, gIdxOf, gActI, repList, repOrbitPairs, pairsArr,
+          pairToLeafSrc,
+          allLeaves, allConds, k,
+          feasibleRegions, sigma, constraints, jStar,
+          violations, done,
+          jStarAssign, wVals, leafSrcs, tij, tji, ei, ej, expr, res},
+
+    (* ---- Pre-compute G-action integer table (same as $dbcSZCheckLeaves) ---- *)
+    nStates    = Length[allStates];
+    stateToIdx = AssociationThread[allStates -> Range[nStates]];
+
+    allGKeys = DeleteDuplicates @ Flatten[Values /@ Values[repToOrbitMap], 1];
+    gIdxOf   = AssociationThread[allGKeys -> Range[Length[allGKeys]]];
+
+    gActI = Table[0, {Length[allGKeys]}, {nStates}];
+    Do[
+      With[{gi = gIdxOf[g]},
+        Do[gActI[[gi, si]] =
+             stateToIdx[$dbcApplyGElem[g, allStates[[si]], nGrid]],
+           {si, nStates}]],
+      {g, allGKeys}];
+
+    repList = Keys[repLeaves];
+    repOrbitPairs = Table[
+      With[{repKey = repList[[ri]],
+            orbitMap = repToOrbitMap[repList[[ri]]]},
+        Table[
+          With[{tgtIdx = stateToIdx[repLeaves[repKey][[li, 2]]]},
+            Map[Function[sKey,
+                {stateToIdx[sKey],
+                 gActI[[gIdxOf[orbitMap[sKey]], tgtIdx]]}],
+              Keys[orbitMap]]],
+          {li, Length[repLeaves[repKey]]}]],
+      {ri, Length[repList]}];
+
+    energyExprs = Map[energy, allStates];
+
+    pairsArr = DeleteDuplicates @ Sort @ Map[Sort,
+      Flatten[repOrbitPairs, 2]];
+    pairsArr = Select[pairsArr, #[[1]] =!= #[[2]] &];
+
+    (* Pre-compute: for each directed pair {src,tgt}, which (ri,li)
+       orbit-expanded leaves contribute to T(src->tgt)?
+       Stored as pairToLeafSrc[{src,tgt}] = {{ri,li}, ...}          *)
+    pairToLeafSrc = <||>;
+    Do[
+      Scan[Function[st,
+        With[{key = {st[[1]], st[[2]]}},
+          pairToLeafSrc[key] =
+            Append[Lookup[pairToLeafSrc, Key[key], {}], {ri, li}]]],
+        repOrbitPairs[[ri, li]]],
+      {ri, Length[repList]},
+      {li, Length[repOrbitPairs[[ri]]]}];
+
+    (* ============================================================
+       PHASE 1 — Extract distinct Piecewise conditions
+       ============================================================ *)
+    allLeaves = Flatten[Values[repLeaves], 1];
+    allConds = DeleteDuplicates @ Select[
+      Flatten @ Map[Function[lf,
+        (* HoldPattern prevents Mathematica evaluating the Piecewise LHS
+           during matching (which would trigger Piecewise::pairs warnings
+           for non-standard clause structures).  We only extract the
+           second element of each 2-element clause.                      *)
+        Cases[lf[[3]],
+              HoldPattern[Piecewise[cl_List, _]] :>
+                (#[[2]] & /@ Select[cl, Length[#] == 2 &]),
+              Infinity]],
+        allLeaves],
+      Function[c,
+        (* Keep only coupling-constant comparisons; discard True, False,
+           === Infinity sentinels, and any non-comparison expressions.  *)
+        MatchQ[c, _Less | _LessEqual | _Greater | _GreaterEqual] &&
+        !FreeQ[c, Alternatives @@ allSymParams]]];
+    k = Length[allConds];
+
+    Print["  EBE: k=", k, " branch condition(s)  →  2^k=", 2^k, " patterns"];
+
+    (* ---- Fallback when k is too large for exhaustive enumeration ---- *)
+    If[k > ebeMaxK,
+      Print["  EBE: k=", k, " exceeds ebeMaxK=", ebeMaxK,
+            " — falling back to probabilistic SZ (",
+            szFallbackReps, " random points)"];
+      Return[$dbcSZCheckLeaves[
+               repLeaves, repToOrbitMap, energy,
+               allStates, nGrid, allSymParams,
+               szFallbackReps, tol]]];
+
+    (* ============================================================
+       PHASE 2 — Enumerate feasible coupling-constant regions
+       ============================================================ *)
+    feasibleRegions = {};
+    Do[
+      sigma = IntegerDigits[pattern, 2, k];
+      (* σ[[i]]=1 → condition i holds (the comparison is True)
+         σ[[i]]=0 → condition i fails (the negation holds)        *)
+      constraints = And @@ Table[
+        If[sigma[[i]] == 1,
+           allConds[[i]],           (* condition True  *)
+           ! allConds[[i]]],        (* condition False *)
+        {i, k}];
+      jStar = Quiet[
+        FindInstance[constraints, allSymParams, Rationals, 1]];
+      If[jStar =!= {} && jStar =!= {{}},
+        AppendTo[feasibleRegions, {sigma, First[jStar]}]],
+      {pattern, 0, 2^k - 1}];
+
+    Print["  EBE: ", Length[feasibleRegions], "/", 2^k,
+          " regions feasible"];
+
+    (* ============================================================
+       PHASE 3 — Exact DB check for each feasible region
+       ============================================================ *)
+    violations = <||>;
+    done       = False;
+
+    Do[
+      If[done, Break[]];
+      {sigma, jStarAssign} = feasibleRegions[[ri]];
+
+      (* Substitute rational J* into every leaf weight.
+         Piecewise conditions (now rational comparisons) auto-resolve:
+           Piecewise[{{val, True}}, 0]  →  val
+           Piecewise[{{val, False}}, 0] →  0
+         β remains symbolic throughout.                              *)
+      wVals = Table[
+        repLeaves[repList[[rj]]][[All, 3]] /. jStarAssign,
+        {rj, Length[repList]}];
+
+      (* Energy values at J* — rational, β-free *)
+      With[{eArr = energyExprs /. jStarAssign},
+
+        Do[
+          With[{i = pair[[1]], j = pair[[2]]},
+
+            leafSrcs = Lookup[pairToLeafSrc, Key[{i, j}], {}];
+            tij = If[leafSrcs === {}, 0,
+                     Total[wVals[[#[[1]], #[[2]]]] & /@ leafSrcs]];
+
+            leafSrcs = Lookup[pairToLeafSrc, Key[{j, i}], {}];
+            tji = If[leafSrcs === {}, 0,
+                     Total[wVals[[#[[1]], #[[2]]]] & /@ leafSrcs]];
+
+            (* Skip pairs with no transitions in this region *)
+            If[tij === 0 && tji === 0, Continue[]];
+
+            ei = eArr[[i]]; ej = eArr[[j]];
+
+            (* DB expression: T(i→j)·exp(-βE(i)) - T(j→i)·exp(-βE(j))
+               For a correct algorithm this is algebraically zero.    *)
+            expr = Expand[
+              tij * Exp[-\[Beta] * ei] - tji * Exp[-\[Beta] * ej]];
+            If[expr === 0, Continue[]];
+
+            res = $dbcIsExpZero[expr];
+            If[res =!= True,
+              If[!KeyExistsQ[violations, pair],
+                violations[pair] =
+                  <|"pair"   -> {allStates[[i]], allStates[[j]]},
+                    "tij"    -> tij,    "tji"   -> tji,
+                    "ei"     -> ei,     "ej"    -> ej,
+                    "region" -> sigma,
+                    "jStar"  -> jStarAssign|>];
+              If[Length[violations] >= 10,
+                done = True; Break[]]]],
+
+          {pair, pairsArr}]],
+
+      {ri, Length[feasibleRegions]}];
+
+    Values[violations]]
+
+
+(* ================================================================
    SECTION 8 — NUMERICAL MCMC CHECK (optional)
    ================================================================ *)
 

@@ -1,0 +1,403 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\geometry{margin=2.5cm}
+
+% ----------------------------------------------------------------
+% Notation macros
+% ----------------------------------------------------------------
+% Coupling constants: \J{ab}{r}  =  couplingJ[a,b,r]
+\newcommand{\J}[2]{\mathcal{J}_{#1,#2}}
+% Forward link probability (zero unless bond is active)
+\newcommand{\W}[1]{W_{#1}}
+% 1 - W_{ab}
+\newcommand{\Wb}[1]{\bar{W}_{#1}}
+% Reverse-only link probability
+\newcommand{\R}[1]{R_{#1}}
+% 1 - R_{ab}
+\newcommand{\Rb}[1]{\bar{R}_{#1}}
+% Indicator functions
+\newcommand{\Afwd}[1]{\theta^{+}_{#1}}
+\newcommand{\Arev}[1]{\theta^{-}_{#1}}
+% Bold state label
+\newcommand{\s}{\mathbf{s}}
+\newcommand{\tp}{\mathbf{t}}
+
+\title{\textbf{VMMC Symbolic Transition Matrix: Representative Entries}\\[4pt]
+       \large Source state $\s = \bigl\{(1,1)^1,\,(1,2)^2,\,(1,3)^3\bigr\}$}
+\author{SZ-DBC checker --- BFS output, \texttt{vmmc\_2d.wl}, $n_\text{grid}=3$}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ----------------------------------------------------------------
+\section*{System and notation}
+% ----------------------------------------------------------------
+
+The source state for all entries is orbit representative~1:
+\[
+  \s \;=\; \bigl\{\underbrace{(1,1)}_{\text{pos}},\!1\bigr\},\,
+           \bigl\{(1,2),2\bigr\},\,
+           \bigl\{(1,3),3\bigr\}
+\]
+three distinct-type particles in the first row of a $3\times3$ torus.
+Each transition entry $T(\s\to\tp)$ is the sum of leaf weights
+from the BFS tree rooted at $\s$.
+
+\paragraph{Coupling constants.}
+$\J{ab}{r}$ denotes \texttt{couplingJ[a,b,r]}: the bare pair energy between
+particle types $a$ and $b$ at squared lattice distance $r\in\{1,2\}$.
+There are 12 symbolic atoms
+$\{\J{11}{1},\J{11}{2},\J{12}{1},\J{12}{2},\J{13}{1},\J{13}{2},
+   \J{22}{1},\J{22}{2},\J{23}{1},\J{23}{2},\J{33}{1},\J{33}{2}\}$.
+
+\paragraph{VMMC link probabilities.}
+The Whitelam--Geissler cluster builder tests each candidate neighbour $q$
+against two bond probabilities.
+\begin{itemize}
+\item \textbf{Forward bond} (energy rises when $p$ moves away from $q$):
+\[
+  \W{ab} \;=\;
+  \begin{cases}
+    1 - e^{\,\beta(\J{ab}{1}-\J{ab}{2})} & \text{if } \J{ab}{1} < \J{ab}{2},\\
+    0 & \text{otherwise}.
+  \end{cases}
+\]
+Write $\Wb{ab} = 1-\W{ab}$.
+
+\item \textbf{Reverse-only bond} (energy rises when $p$ would move \emph{toward}
+  $q$ in the reverse direction, with no current interaction):
+\[
+  \R{ab} \;=\;
+  \begin{cases}
+    1 - e^{\,\beta\,\J{ab}{1}} & \text{if } \J{ab}{1} < 0,\\
+    0 & \text{otherwise}.
+  \end{cases}
+\]
+Write $\Rb{ab} = 1-\R{ab}$.
+\end{itemize}
+
+\paragraph{Base factor.}
+Selecting one particle from three ($2$ bits via \texttt{RandomChoice}) and
+one direction from eight ($3$ bits via \texttt{RandomChoice}) gives a base
+factor of $(1/2)^2\times(1/2)^3 = 1/32$ per leaf path.
+A denominator of $1/16$ indicates two symmetry-related paths (same bond
+structure, different particle/direction) that contribute identical Piecewise
+expressions and are summed by the BFS.
+
+\paragraph{Piecewise conditions in rep~1.}
+The BFS over $\s$ finds exactly \textbf{six distinct branch conditions}:
+\[
+  \underbrace{(\J{12}{1}<\J{12}{2}),\;
+              (\J{13}{1}<\J{13}{2}),\;
+              (\J{23}{1}<\J{23}{2})}_{\text{forward-bond conditions }A_{ab}}
+  \quad\text{and}\quad
+  \underbrace{(\J{12}{1}<0),\;
+              (\J{13}{1}<0),\;
+              (\J{23}{1}<0)}_{\text{reverse-bond conditions }B_{ab}}
+\]
+This gives $k=6$, i.e.\ $2^6=64$ branch regions to test under EBE.
+
+% ----------------------------------------------------------------
+\section{Entries 1--3: single-bond moves (depth 6, one leaf each)}
+% ----------------------------------------------------------------
+
+These are the simplest non-trivial transitions: one particle moves in a
+direction that takes it away from exactly one current neighbour.
+The VMMC builder tests only that one bond; the other particles are too far
+from the moved particle's new position to be included in the cluster.
+
+\subsubsection*{Entry 1: $\s\to\{(1,1)^1,(1,2)^2,(2,1)^3\}$
+  --- particle~3 moves}
+
+\[
+  T(\s\to\tp_1) \;=\; \frac{\Wb{23}}{32}
+  \;=\; \frac{1}{32}\Biggl(1 - \W{23}\Biggr)
+  \;=\;
+  \frac{1}{32}
+  \begin{cases}
+    e^{\,\beta(\J{23}{1}-\J{23}{2})} & \text{if } \J{23}{1}<\J{23}{2},\\
+    1 & \text{otherwise.}
+  \end{cases}
+\]
+
+Bit sequence depth: 6 (5 selection bits + 1 bond-acceptance bit).\\
+\textit{Physical meaning:} particle~3 moves diagonally away from particle~2
+(type-2,3 pair). The forward bond probability $\W{23}$ is non-zero only when
+$\J{23}{1}<\J{23}{2}$, i.e.\ when the energy increases as the pair separates.
+The leaf weight captures the probability that the bond was \emph{not} formed
+($1-\W{23}$), so particle~3 moves alone.
+
+\subsubsection*{Entry 2: $\s\to\{(1,1)^1,(1,2)^2,(2,2)^3\}$
+  --- particle~3 moves (different direction)}
+
+\[
+  T(\s\to\tp_2) \;=\; \frac{\Wb{13}}{32}
+  \;=\;
+  \frac{1}{32}
+  \begin{cases}
+    e^{\,\beta(\J{13}{1}-\J{13}{2})} & \text{if } \J{13}{1}<\J{13}{2},\\
+    1 & \text{otherwise.}
+  \end{cases}
+\]
+
+Depth: 6.  Only the type-1,3 bond is tested (particle~1 at $(1,1)$ is now
+the relevant close neighbour after the move).
+
+\subsubsection*{Entry 3: $\s\to\{(1,1)^1,(1,2)^2,(3,1)^3\}$
+  --- same expression as Entry~1}
+
+\[
+  T(\s\to\tp_3) \;=\; \frac{\Wb{23}}{32}
+\]
+
+Depth: 6.  Despite a different target state (particle~3 moved further, to
+row~3), the single bond tested is still the 2,3 pair at the same distance
+class change, giving the identical Piecewise expression.  This illustrates
+that distinct transitions can carry identical symbolic weights.
+
+% ----------------------------------------------------------------
+\section{Entries 4--5: two-bond moves (depth 7, one leaf each)}
+% ----------------------------------------------------------------
+
+When the moved particle separates from two neighbours simultaneously,
+the BFS generates one additional branch, giving depth~7.
+
+\subsubsection*{Entry 4: $\s\to\{(1,1)^1,(1,2)^2,(2,3)^3\}$
+  --- particle~3, two bonds checked}
+
+\[
+  T(\s\to\tp_4) \;=\; \frac{\Wb{13}\cdot\Wb{23}}{32}
+\]
+
+Depth: 7.  Particle~3 moves into a position where both particle~1 (type~1,3
+pair) and particle~2 (type~2,3 pair) are candidates.  Neither bond is formed:
+$T(\s\to\tp_4)$ is non-zero in all four branch regions of
+$(A_{13},A_{23})\in\{0,1\}^2$, but takes different values in each.
+
+\subsubsection*{Entry 5: $\s\to\{(1,1)^1,(1,3)^3,(2,2)^2\}$
+  --- particle~2 moves}
+
+\[
+  T(\s\to\tp_5) \;=\; \frac{\Wb{12}\cdot\Wb{23}}{32}
+\]
+
+Depth: 7.  Now particle~2 (type~2) moves away from both particle~1 (type~1,2
+pair) and particle~3 (type~2,3 pair).  The bond conditions now involve
+$A_{12}$ and $A_{23}$ rather than $A_{13}$ and $A_{23}$.  This entry
+demonstrates that different particle choices activate different pairs of
+branch conditions from the $k=6$ total.
+
+% ----------------------------------------------------------------
+\section{Entry 6: the self-loop --- 54 leaves, depth 6--10}
+% ----------------------------------------------------------------
+
+The self-loop $T(\s\to\s)$ collects all paths that return to $\s$: rejected
+moves, frustrated cluster builds, and overlap-blocked moves.  It has
+\textbf{54 contributing leaves} at depths 6--10.  A representative sample
+of six terms is shown, illustrating the three structural classes:
+
+\paragraph{Class A --- bond formed then frustrated (depth~6).}
+A forward bond is accepted ($\W{ab}$ factor) but the frustration check
+immediately rejects the cluster because the reverse bond probability is zero:
+\begin{align}
+  \text{(i)}\quad&\frac{\W{12}}{32}
+    = \frac{1}{32}\begin{cases}
+        1-e^{\,\beta(\J{12}{1}-\J{12}{2})} & \J{12}{1}<\J{12}{2},\\0&\text{o.w.}
+      \end{cases}\\[4pt]
+  \text{(ii)}\quad&\frac{\W{13}}{32}
+    = \frac{1}{32}\begin{cases}
+        1-e^{\,\beta(\J{13}{1}-\J{13}{2})} & \J{13}{1}<\J{13}{2},\\0&\text{o.w.}
+      \end{cases}\\[4pt]
+  \text{(iii)}\quad&\frac{\W{23}}{32}
+    \quad\text{(analogously for the 2,3 pair)}
+\end{align}
+
+\paragraph{Class B --- reverse-bond check, no cluster formed (depth~6).}
+The moved particle has no current interaction with a candidate neighbour, but
+the reverse bond check (condition $B_{ab}$) contributes:
+\begin{align}
+  \text{(iv)}\quad&\frac{\Rb{13}}{32}
+    = \frac{1}{32}\begin{cases}
+        e^{\,\beta\,\J{13}{1}} & \J{13}{1}<0,\\1&\text{o.w.}
+      \end{cases}\\[4pt]
+  \text{(v)}\quad&\frac{\Rb{12}}{32},\qquad
+  \frac{\Rb{23}}{32}
+    \quad\text{(analogously for the other pairs)}
+\end{align}
+
+\paragraph{Class C --- multi-bond frustrated path (depth~9--10).}
+Two bonds are tested and accepted, but the frustration check on the second
+neighbour rejects the cluster.  A representative depth-9 term:
+\begin{equation}
+  \text{(vi)}\quad\frac{1}{16}\,
+    \underbrace{\Afwd{12}}_{=1\text{ iff }A_{12}}\!\cdot\,
+    \underbrace{(1-\Afwd{13})}_{=1\text{ iff }\neg A_{13}}\!\cdot\,
+    \W{12}\cdot\W{13}\cdot\Wb{23}
+\end{equation}
+where $\Afwd{ab}\equiv\mathbf{1}[\J{ab}{1}<\J{ab}{2}]$ is the indicator
+of the forward-bond condition.  The factor $1/16=2\times(1/32)$ reflects
+two symmetry-related particle/direction choices giving identical weights.
+
+The full $T(\s\to\s)$ expression contains \textbf{22 distinct terms},
+spanning all six conditions $\{A_{12},A_{13},A_{23},B_{12},B_{13},B_{23}\}$
+and products thereof.  It is non-zero for every coupling-constant
+configuration (since the cluster builder always has a non-zero probability
+of rejection), and its complexity highlights why the self-loop is the
+hardest single entry to evaluate symbolically.
+
+% ----------------------------------------------------------------
+\section{Entries 7--10: 3-particle cluster move --- 9 leaves, depth 9--10}
+% ----------------------------------------------------------------
+
+When all three particles move together, the cluster builder must accept
+\emph{two} bond pairs successfully.  With three particles there are three
+distinct ways to ``chain'' them:
+(1,2) and (1,3);~~ (1,2) and (2,3);~~ (1,3) and (2,3).
+
+The target state $\tp_6=\{(2,1)^1,(2,2)^2,(2,3)^3\}$ (all particles shifted
+to row~2) has exactly 9 contributing leaves.  We display six of them:
+
+\subsubsection*{Entries 7--9: three depth-9 ``two-bond'' leaves}
+
+Each of the three chaining routes contributes one depth-9 leaf.  The seed
+particle opens a bond with one neighbour (accepted), that neighbour then
+opens a bond with the third particle (accepted), and no further neighbours
+are in range:
+
+\begin{align}
+  \ell_1&:\quad
+    \frac{1}{32}\,\Afwd{12}\,\Afwd{13}\,\W{12}\,\W{13}
+    \label{eq:l1}\\[6pt]
+  \ell_2&:\quad
+    \frac{1}{32}\,\Afwd{12}\,\Afwd{23}\,\W{12}\,\W{23}
+    \label{eq:l2}\\[6pt]
+  \ell_3&:\quad
+    \frac{1}{32}\,\Afwd{13}\,\Afwd{23}\,\W{13}\,\W{23}
+    \label{eq:l3}
+\end{align}
+
+The indicator pairs $(\Afwd{12},\Afwd{13})$ etc.\ are products of indicator
+functions that are themselves Piecewise with value 1 inside the respective
+branch region and 0 outside.  Each leaf is \textbf{active in only one
+quadrant} of the $(A_{ab})$ space: $\ell_1$ is non-zero only when
+$A_{12}\wedge A_{13}$, etc.
+
+\subsubsection*{Entry 10: a depth-10 leaf with three-bond check}
+
+When all three bond conditions are active simultaneously, the BFS explores
+a third candidate after the second bond is accepted, contributing depth-10
+leaves that include a ``check and reject'' factor $(1-\W{ab})$:
+
+\begin{equation}
+  \ell_4:\quad
+  \frac{1}{16}\,\Afwd{13}\,\Afwd{23}\,
+  \underbrace{(1-\W{12})}_{\text{12 bond NOT formed}}\!\cdot\,\W{13}\cdot\W{23}
+  \label{eq:l4}
+\end{equation}
+
+The factor $1/16$ (doubling of $1/32$) reflects two particle/direction paths
+that both trigger this three-candidate sequence.
+
+\medskip
+The full $T(\s\to\tp_6)$ is the sum
+$\ell_1+\ell_1'+\ell_2+\ell_2'+\ell_3+\ell_3'+\ell_4+\ell_5+\ell_6$
+where primed terms are depth-10 analogues of $\ell_1,\ell_2,\ell_3$ that
+include one extra ``third neighbour checked and rejected'' factor.
+
+\bigskip
+The target state $\tp_7=\{(3,1)^1,(3,2)^2,(3,3)^3\}$ (all shifted to row~3)
+has \textbf{exactly the same Piecewise expression} as $T(\s\to\tp_6)$.
+This is a direct consequence of translational invariance: the row-3 target is
+the row-2 target translated by one row, and the BFS correctly produces
+identical symbolic transition weights in both cases.
+
+% ----------------------------------------------------------------
+\section{Discussion: structure and implications for EBE}
+% ----------------------------------------------------------------
+
+\subsection{What the expressions reveal}
+
+\paragraph{Only 6 distinct conditions for this orbit rep.}
+Despite a BFS depth of up to 10 and 102 total leaves, the entire transition
+row from $\s$ involves only $k=6$ distinct Piecewise branch conditions:
+three forward-bond conditions $A_{ab}$ and three reverse-bond conditions
+$B_{ab}$.  The coupling-constant space is partitioned into at most $2^6=64$
+branch regions.
+
+\paragraph{Each leaf activates a specific subset of conditions.}
+Shallow leaves (depth 6) activate exactly one condition.  Medium leaves
+(depth 7) activate a product of two.  Deep leaves (depth 9--10) activate
+three or more.  No single leaf activates all six simultaneously: the
+depth-10 leaves involve at most four conditions at once.
+
+\paragraph{The self-loop mixes forward and reverse conditions.}
+Leaves contributing to $T(\s\to\s)$ include both $A_{ab}$ and $B_{ab}$
+conditions because frustrated paths can arise either from an active forward
+bond with no reverse partner (class~A) or from a reverse-only bond with no
+forward partner (class~B).  This is the only transition row that exercises
+the $B_{ab}$ conditions.
+
+\paragraph{Cluster moves vanish outside their activation region.}
+Entries 7--10 are exactly zero unless \emph{at least two} forward-bond
+conditions are simultaneously satisfied.  In the branch regions where all
+$A_{ab}=0$, the 3-particle cluster move has zero probability --- the system
+is purely a single-particle mover in that parameter regime.
+
+\subsection{Feasibility of Exhaustive Branch Enumeration (EBE)}
+
+EBE replaces the 30-point random substitution of the current SZ check with
+an explicit test of every feasible branch region.  For this orbit rep:
+
+\begin{center}
+\begin{tabular}{lrl}
+\toprule
+Quantity & Value & Notes \\
+\midrule
+Distinct conditions $k$ (rep~1) & 6 & $\{A_{12},A_{13},A_{23},B_{12},B_{13},B_{23}\}$ \\
+Branch regions ($2^k$) & 64 & upper bound; some may be infeasible \\
+Leaves contributing to any $T(\s\to\tp)$ & 102 & spread across depth 6--10 \\
+Distinct target states & 27 & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Across all 56 orbit representatives, more conditions will appear (different
+neighbours $\Rightarrow$ different type-pair/distance combinations), but
+conditions repeat heavily across reps.  A conservative estimate gives
+$k\approx 10$--$15$ globally, i.e.\ $2^{10}$--$2^{15}=1{,}024$--$32{,}768$
+regions total.
+
+For each region, the procedure is:
+\begin{enumerate}
+  \item Find a rational coupling point $\mathbf{J}^*$ satisfying that region's
+    linear inequality system (a small LP).
+  \item Substitute $\mathbf{J}^*$: every Piecewise collapses to either
+    a rational number or a rational~$\times e^{-\beta\cdot r}$ with
+    $r\in\mathbb{Q}$.
+  \item With $\beta=1$ absorbed, all weights are rationals or
+    rational~$\times e^{-r}$ with $r\in\mathbb{Q}$.
+  \item For each communicating pair $(s,t)$, form
+    $T(s{\to}t)e^{-E(s)}-T(t{\to}s)e^{-E(t)}$ and call
+    \texttt{\$dbcIsExpZero}: exact rational arithmetic, no floating point.
+\end{enumerate}
+
+The current random-substitution SZ check with 30 points tests 30 out of
+64 (or $2^{15}$) regions.  With $k=6$ for rep~1, the probability of any
+given region being missed is $(1-1/64)^{30}\approx62\%$; for $k=15$,
+this rises to essentially~100\%.  EBE eliminates this coverage gap entirely
+and replaces a probabilistic certificate with a proof.
+
+The structure of the expressions --- products of at most 5 Piecewise factors,
+with conditions that are simple linear inequalities in at most 4 coupling
+constants --- makes the LP feasibility checks trivially fast
+($\ll 1\,\text{ms}$ each), and the $\texttt{\$dbcIsExpZero}$ check on each
+pair is a handful of rational additions.  \textbf{EBE is therefore not only
+exact but likely faster than the current 30-point SZ loop for this system.}
+
+\end{document}
