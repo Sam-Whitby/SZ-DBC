@@ -67,11 +67,13 @@ If the algorithm contains non-translation-invariant operations (e.g., an absolut
 
 The BFS engine runs on each orbit representative. Leaves accumulate as `{bits, nextState, weight}` triples.
 
-### Step 5b — Rotational invariance (D4, numerical)
+### Step 5b — Rotational invariance (D4, algebraic via EBE)
 
-If `"D4"` is in `$symmetryGroup` and translation invariance passed, D4 is verified numerically: the transition matrix `T` is evaluated at several random coupling-parameter points and the checker verifies `T(s→t) = T(R·s→R·t)` for all communicating pairs. If confirmed, orbit representatives are reduced by the full D4 group and the BFS is re-run on the smaller set.
+If `"D4"` is in `$symmetryGroup` and translation invariance passed, D4 is verified algebraically using the EBE machinery. The check runs the same Phase 1 (condition extraction) and Phase 2 (chamber enumeration) as the DB check, then in Phase 3 verifies `T(s→t) = T(R·s→R·t)` exactly within every feasible parameter region using `$dbcIsExpZero`.
 
-**Limitation**: this check is numerical. It is reliable in practice (a random coupling point is unlikely to accidentally satisfy the symmetry condition if the algorithm is truly asymmetric), but not a formal algebraic proof.
+Only two D4 generators are checked — rotation by 90° (rotIdx=1) and a left-right reflection (rotIdx=4). By group theory, if `T(s→t) = T(R·s→R·t)` holds for both generators for all pairs (s,t) and all parameter regions, it holds for all 8 D4 elements. C4 symmetry (rotation-only) is verified by the first generator alone.
+
+The EBE chambers computed here are reused by the DB check (Step 8), so no duplicate Phase 2 enumeration occurs. Falls back to probabilistic SZ when k > ebeMaxK (same threshold as DB check).
 
 ### Step 7 — Ergodicity
 
@@ -114,6 +116,8 @@ DynamicSymParams[states_List] :=   (* returns coupling parameter atoms *)
 | `RandomReal[{lo,hi}]` | Uniform continuous token |
 | `RandomInteger[{lo,hi}]` | Exact rejection sampling; weight corrected |
 | `RandomChoice[list]` | Exact rejection sampling; weight corrected |
+| `RandomInteger[{lo,hi}, count]` | count independent integers via rejection sampling |
+| `RandomInteger[n, count]` | count independent integers in {0..n} |
 | `RandomChoice[weights->elems]` | Sequential Bernoulli decomposition |
 | `RandomVariate[NormalDistribution[mu,sigma]]` | Discretised to nearby integers |
 | `RandomPermutation`, `RandomSample` | Fisher-Yates via `RandomInteger` |
@@ -167,6 +171,8 @@ The two `broken_*` files contain algorithms that genuinely violate detailed bala
 
 ## Known limitations
 
-**D4 check is numerical.** A formal algebraic proof of rotational symmetry is not yet implemented. The numerical check has never been observed to give a false positive in practice, but is not formally guaranteed.
+**D4 check is algebraic but slow for many coupling parameters.** The EBE-based D4 check scales as O(feasibleRegions × pairs × generators). For algorithms with many distinct pairwise distances (large k), this can take several minutes. vmmc_2d.wl (k=12, 512 regions) takes ~240s for D4 EBE. The fallback to probabilistic SZ occurs when k > ebeMaxK (default 50).
 
 **τ-BFS cantHandle for in-body Mod.** If the algorithm normalises particle positions inside the step function using `Mod[pos, n]` on symbolic values, Mathematica may trigger internal evaluation calls that are intercepted by the BFS override, causing a cantHandle error. The checker falls back to the full state-space BFS without the translation speedup.
+
+**BFS timeout aborts the run.** If a BFS path exceeds the per-state time limit (`-timeLimit`), the checker now aborts with an error rather than returning partial leaves. Increase `-timeLimit` if needed.

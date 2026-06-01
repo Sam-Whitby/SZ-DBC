@@ -272,24 +272,30 @@ $runBFS[repsIn_List] :=
     {leavesNew, errNew}];
 
 d4Result = <|"d4Pass" -> False, "label" -> "not checked"|>;
+rotCheck  = <|"pass" -> False, "ebe" -> False, "chambers" -> {}|>;
 
 If[wantD4 && tauResult["tauFree"] === True,
   printSection["Step 5b: Rotational invariance check (D4)"];
   t5b = AbsoluteTime[];
-  (* nReps scales slightly with number of coupling parameters *)
+  (* nReps used only when EBE falls back to numerical check *)
   d4CheckReps = Max[5, Min[10, Length[symParamList] + 2]];
-  (* Check all 7 non-identity D4 elements *)
-  rotCheck = $dbcCheckRotational[
+  (* Check via D4 generators {rot90CW=1, LR-reflect=4}.
+     By group theory: if T(s→t)=T(R·s→R·t) for both generators,
+     it holds for all 8 D4 elements (generators span the group).
+     C4 is verified by generator 1 alone; reflections require 4. *)
+  rotCheck = $dbcEBECheckD4[
     repLeaves, repToOrbitMap, allStates, nGrid, symParamList,
-    Range[1, 7], d4CheckReps];
+    {1, 4}, ebeMaxK, d4CheckReps];
   Print["  Time: ", Round[AbsoluteTime[] - t5b, 0.01], "s"];
 
   Which[
     rotCheck["pass"],
       (* Full D4 verified *)
-      Print["  PASS — full D4 symmetry verified (",
-            d4CheckReps, " random coupling points)"];
-      d4Result = <|"d4Pass" -> True, "label" -> "D4 (verified)"|>;
+      (* rotCheck["violations"] is empty; determine if EBE or numerical was used *)
+      If[rotCheck["ebe"],
+        Print["  PASS — full D4 symmetry verified (algebraically exact via EBE)"],
+        Print["  PASS — full D4 symmetry verified (", d4CheckReps, " random coupling points)"]];
+      d4Result = <|"d4Pass" -> True, "label" -> If[rotCheck["ebe"], "D4 (exact)", "D4 (numerical)"]|>;
       allGElems = $dbcAllGElems[nGrid, symGroup];
       {reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
       Print["  |G| = ", Length[allGElems], "  →  ", Length[reps],
@@ -303,9 +309,11 @@ If[wantD4 && tauResult["tauFree"] === True,
 
     (* C4 rotations only? Check elements 1-3 separately *)
     Select[rotCheck["violations"], #["rot"] <= 3 &] === {},
-      Print["  PASS — C4 (rotations) verified; reflections failed"];
+      If[rotCheck["ebe"],
+        Print["  PASS — C4 (rotations) verified (algebraically exact); reflections failed"],
+        Print["  PASS — C4 (rotations) verified; reflections failed"]];
       Print["  Using C4+translation orbits"];
-      d4Result = <|"d4Pass" -> True, "label" -> "C4 (verified)"|>;
+      d4Result = <|"d4Pass" -> True, "label" -> If[rotCheck["ebe"], "C4 (exact)", "C4 (numerical)"]|>;
       allGElems = $dbcAllGElems[nGrid, Union[DeleteCases[symGroup, "D4"], {"C4"}]];
       {reps, repOfState, repToOrbitMap} = $dbcComputeOrbits[allStates, allGElems, nGrid];
       Print["  |G| = ", Length[allGElems], "  →  ", Length[reps],
@@ -376,12 +384,16 @@ If[mode === "SZPure",
 
   (* Default: EBE exact check — enumerates all coupling-constant
      branch regions and checks DB exactly with $dbcIsExpZero.
-     Falls back to probabilistic SZ when k > ebeMaxK.             *)
+     Falls back to probabilistic SZ when k > ebeMaxK.
+     If D4 EBE ran (d4Result["ebe"]==True), reuse its feasible
+     regions to skip the expensive Phase 2 chamber enumeration.   *)
   violations = $dbcEBECheckLeaves[
     repLeaves, repToOrbitMap,
     Function[st, Block[{$nGrid=nGrid}, energy[st]]],
     allStates, nGrid, symParamList,
-    ebeMaxK, szRepeats]]];
+    ebeMaxK, szRepeats, 1*^-7,
+    If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
+       rotCheck["chambers"], {}]]]];
 
 Print["  Time: ", Round[AbsoluteTime[]-t8, 0.01], "s"];
 If[violations === {},

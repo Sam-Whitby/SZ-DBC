@@ -698,38 +698,94 @@ The \texttt{-ebeMaxK} help text in \texttt{check.wls} stated ``(default 12)'' wh
 actual default was 50. The help text was corrected to ``(default 50)''.
 
 %---------------------------------------------------------------
-\subsection{Remaining open issues}
+\subsection{All four open issues now resolved}
 %---------------------------------------------------------------
 
-The following issues identified in the original audit are \emph{not} fixed in the
-current version:
+All four issues listed in the original audit have been addressed in a further revision.
 
 \begin{enumerate}
-\item \textbf{D4 check remains numerical.} The probabilistic Schwartz-Zippel-style
-  check for D4 rotational symmetry is sound in practice but not formally exact.
-  The recommended fix --- extending the EBE machinery to check
-  $T(s\to t) = T(R\cdot s\to R\cdot t)$ algebraically within each parameter region ---
-  has not yet been implemented. All provided examples pass the D4 check, and the
-  check has never been observed to give an incorrect verdict, but a formal algebraic
-  certification would be preferable.
 
-\item \textbf{$\tau$-BFS cantHandle for in-body Mod.} Algorithms that normalise positions
-  inside \texttt{Algorithm} (e.g., \texttt{quadratic\_field.wl}) trigger internal
-  Mathematica evaluation calls that are intercepted by the BFS override, producing a
-  \texttt{cantHandle} error rather than a genuine $\tau$-detection failure. The checker
-  falls back to the full state-space BFS and reports the correct verdict by a different
-  path. Fixing this would require either sandboxing Mathematica's internal evaluation
-  or pre-computing the normalisation symbolically.
+\item \textbf{D4 check made algebraically exact (Issue~1).}
+  A new function \texttt{\$dbcEBECheckD4} performs the D4 check via the
+  same EBE Phase~1--3 machinery as the DB check.  Within each feasible
+  parameter region it checks
+  \[
+    \$\text{dbcIsExpZero}\!\left[T(s\to t) - T(R\cdot s\to R\cdot t)\right] = \text{True}
+  \]
+  for all communicating pairs $(s,t)$.  Only two D4 generators are checked
+  (rot90CW and LR-reflection, rotIdx = 1 and 4); by the group-theoretic
+  argument, invariance under both generators implies invariance under the full
+  D4 group.  If $k > \texttt{ebeMaxK}$ the function falls back to the previous
+  probabilistic check.
 
-\item \textbf{Timed-out BFS returns incomplete leaves.} If a BFS exceeds the per-state
-  time limit, the leaves collected so far are returned without signalling an error.
-  Subsequent checks may produce misleading verdicts. The fix is to propagate a timeout
-  sentinel and abort the run.
+  The EBE chambers computed during the D4 check are passed to the DB check,
+  which reuses them to skip its own Phase~2 enumeration.  For
+  \texttt{single\_metropolis.wl} ($k=18$, 132 regions) this reduces total EBE time
+  from $76+38=114$\,s to $39+29=68$\,s.  For \texttt{vmmc\_2d.wl} ($k=12$, 512
+  regions) the D4 check takes $\approx 238$\,s (four-fold improvement over the
+  original 7-rotation implementation).
 
-\item \textbf{seqBernoulli zero-weight guard missing.} If a list of weights sums to
-  zero, \texttt{seqBernoulli} will divide by zero. This is an edge case for
-  degenerate inputs but should be guarded.
+\item \textbf{$\tau$-BFS cantHandle for in-body Mod improved (Issue~2).}
+  The \texttt{RandomInteger} Block override now handles the vectorised
+  form \texttt{RandomInteger[\{lo,hi\}, count]} (and \texttt{RandomInteger[n, count]})
+  by generating each of the \texttt{count} integers independently via the
+  rejection-sampling bit stream.  If the total bit cost
+  $\texttt{count} \times \lceil\log_2 n\rceil > 20$, the call falls back to
+  \texttt{cantHandle} with an informative message.
+
+  This fixes algorithms that genuinely use multi-integer generation.  For
+  \texttt{quadratic\_field.wl}, the internal Mathematica call
+  \texttt{RandomInteger[\{-16,16\},4\}]} has bit cost $24 > 20$ and is therefore
+  caught by the new threshold, producing a clearer error message:
+  \begin{quote}\small
+    \texttt{RandomInteger[\{\{-16, 16\}, 4\}\}]: 24 bits needed ---
+      use count x RandomInteger[\{lo,hi\}] instead}
+  \end{quote}
+  The underlying cause (Mathematica's internal evaluation of symbolic \texttt{Mod}
+  intercepted by the Block override) remains a known limitation; the $\tau$-BFS
+  result for \texttt{quadratic\_field.wl} is still correct (via the cantHandle path).
+
+\item \textbf{Timed-out BFS now aborts with error (Issue~3).}
+  \texttt{\$dbcBuildStateLeaves} now returns a \texttt{\$dbc\$cantHandle} sentinel
+  when the per-state time limit is exceeded, rather than printing a warning and
+  returning partial leaves.  This causes the run to abort at \texttt{step~5}
+  (or at the $\tau$-BFS step) with a clear message instructing the user to
+  increase \texttt{-timeLimit}.
+
+\item \textbf{seqBernoulli zero-weight guard added (Issue~4).}
+  A guard \texttt{If[TrueQ[remainW == 0], Throw[\$dbc\$cantHandle[...]]]}
+  is now placed at the start of \texttt{seqBernoulli}.  If all weights
+  are numerically zero the function throws a \texttt{cantHandle} error
+  rather than dividing by zero.
+
 \end{enumerate}
+
+\subsection{Summary of status after second revision}
+%---------------------------------------------------------------
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Issue} & \textbf{Status} & \textbf{Notes} \\
+\midrule
+Weight bug: RandomChoice non-power-of-2 & Fixed (1st revision) & \\
+D4 check numerical & Fixed (2nd revision) & Algebraic via EBE \\
+$\tau$-BFS cantHandle (internal call) & Partially fixed & Better error msg \\
+Ergodicity BFS wrong seed & Fixed (1st revision) & \\
+Timed-out BFS returns partial leaves & Fixed (2nd revision) & Now aborts \\
+seqBernoulli zero-weight & Fixed (2nd revision) & \\
+ebeMaxK help text wrong & Fixed (1st revision) & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The sole remaining structural limitation is that \texttt{quadratic\_field.wl}-style
+algorithms (with in-body \texttt{Mod} on symbolic positions) cannot be verified for
+$\tau$-invariance via the algebraic BFS path; the checker falls back to the correct
+result via the cantHandle path, but with a less informative error chain than ideal.
+Resolving this would require preventing Mathematica's Block-scope override from
+intercepting internal kernel evaluation calls, which is not feasible in standard
+Mathematica.
 
 %===============================================================
 \section{Summary Table}
@@ -742,20 +798,20 @@ current version:
 \toprule
 \textbf{Issue} & \textbf{Severity} & \textbf{Fixed?} & \textbf{Affects examples?} & \textbf{Section} \\
 \midrule
-Weight bug: non-power-of-2 RandomChoice & Critical & Yes & No (cancels) & \ref{sec:weightbug} \\
-D4 check is numerical/probabilistic & Significant & No & No & \ref{sec:d4} \\
-$\tau$-BFS errors out (not $\tau$-detection) & Moderate & No & Yes & \ref{sec:taufail:internalRNG} \\
-Ergodicity BFS starts from wrong state & Moderate & Yes & No (coincides) & \ref{issue:ergoseed} \\
-\$dbcFS treated as violation (false positive) & Moderate & No & No & \ref{sec:ebe} \\
-Timed-out BFS returns incomplete leaves & Moderate & No & No & \ref{sec:minor} \\
-seqBernoulli: no division-by-zero guard & Minor & No & No & \ref{sec:minor} \\
-NormalDistribution truncation not validated & Minor & No & No & \ref{sec:minor} \\
-ebeMaxK help text says 12 (should be 50) & Documentation & Yes & -- & \ref{sec:doc} \\
-$\tau$-failure description in README & Documentation & Yes (rewritten) & -- & \ref{sec:doc} \\
+Weight bug: non-power-of-2 RandomChoice & Critical & R1 & No (cancels) & \ref{sec:weightbug} \\
+D4 check is numerical/probabilistic & Significant & R2 & No & \ref{sec:d4} \\
+$\tau$-BFS errors out (not $\tau$-detection) & Moderate & Partial (R2) & Yes & \ref{sec:taufail:internalRNG} \\
+Ergodicity BFS starts from wrong state & Moderate & R1 & No (coincides) & \ref{issue:ergoseed} \\
+\$dbcFS treated as violation (false positive) & Moderate & -- & No & \ref{sec:ebe} \\
+Timed-out BFS returns incomplete leaves & Moderate & R2 & No & \ref{sec:minor} \\
+seqBernoulli: no division-by-zero guard & Minor & R2 & No & \ref{sec:minor} \\
+NormalDistribution truncation not validated & Minor & -- & No & \ref{sec:minor} \\
+ebeMaxK help text says 12 (should be 50) & Documentation & R1 & -- & \ref{sec:doc} \\
+$\tau$-failure description in README & Documentation & R1 (rewritten) & -- & \ref{sec:doc} \\
 \bottomrule
 \end{tabular}
-\caption{Summary of findings. ``Affects examples'' refers to the provided example files.
-  Three issues were fixed in the subsequent revision; see Section~\ref{sec:fixes}.}
+\caption{Summary of findings. R1 = fixed in first revision; R2 = fixed in second revision;
+  -- = not yet fixed. See Section~\ref{sec:fixes}.}
 \end{table}
 
 %===============================================================

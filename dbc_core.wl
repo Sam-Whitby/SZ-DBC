@@ -268,6 +268,8 @@ RunWithBitsAT[alg_, state_, bits_List] :=
 
     seqBernoulli[ws_List, elems_List] :=
       Module[{n = Length[elems], remainW = Total[ws], chosen = Length[elems], var, p},
+        If[TrueQ[remainW == 0],
+          Throw[$dbc$cantHandle["RandomChoice[w->e]: all weights are zero"], $dbc$tag]];
         Do[
           var = makeRealVar[];
           p   = ws[[i]] / remainW;
@@ -298,6 +300,26 @@ RunWithBitsAT[alg_, state_, bits_List] :=
                 If[n==1,0,
                   k=IntegerLength[n-1,2]; val=$dbc$readBitsAsInt[k,readBit];
                   If[val>=n, Throw[$dbc$outOfRange,$dbc$tag], weight*=2^k/n; val]]],
+            MatchQ[args,{{_Integer,_Integer},_Integer?Positive}],
+              Module[{lo=args[[1,1]],hi=args[[1,2]],count=args[[2]],n,k},
+                n=hi-lo+1; If[n==1, Table[lo,{count}],
+                  k=IntegerLength[n-1,2];
+                  If[count*k>20,
+                    Throw[$dbc$cantHandle["RandomInteger["<>ToString[args]<>
+                      "]: "<>ToString[count*k]<>" bits needed — use count x RandomInteger[{lo,hi}] instead"],$dbc$tag]];
+                  Table[With[{val=$dbc$readBitsAsInt[k,readBit]},
+                    If[val>=n,Throw[$dbc$outOfRange,$dbc$tag],weight*=2^k/n; lo+val]],
+                  {count}]]],
+            MatchQ[args,{_Integer?NonNegative,_Integer?Positive}],
+              Module[{n=args[[1]]+1,count=args[[2]],k},
+                If[n==1, Table[0,{count}],
+                  k=IntegerLength[n-1,2];
+                  If[count*k>20,
+                    Throw[$dbc$cantHandle["RandomInteger["<>ToString[args]<>
+                      "]: "<>ToString[count*k]<>" bits needed — use count x RandomInteger[n] instead"],$dbc$tag]];
+                  Table[With[{val=$dbc$readBitsAsInt[k,readBit]},
+                    If[val>=n,Throw[$dbc$outOfRange,$dbc$tag],weight*=2^k/n; val]],
+                  {count}]]],
             True, Throw[$dbc$cantHandle["RandomInteger["<>ToString[args]<>"]"],$dbc$tag]]]],
         RandomChoice = Function[Module[{args = {##}},
           Which[
@@ -403,7 +425,10 @@ $dbcBuildStateLeaves[state_, alg_, maxDepth_Integer, tlim_,
         True,
           {ns, w} = res;
           AppendTo[leaves, {bits, normFn[ns], w}]]];
-    If[timedOut, Print["  WARNING: time limit reached for state ", state]];
+    If[timedOut,
+      Return[$dbc$cantHandle[
+        "BFS time limit (" <> ToString[tlim] <> "s) exceeded for state " <>
+        ToString[Short[state, 3]] <> ". Increase -timeLimit."], Module]];
     leaves]
 
 
@@ -749,7 +774,8 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
                    allSymParams_List,
                    ebeMaxK_Integer : 50,
                    szFallbackReps_Integer : 30,
-                   tol_ : 1*^-7] :=
+                   tol_ : 1*^-7,
+                   precomputedChambers_ : {}] :=
   Module[{nStates, stateToIdx, energyExprs,
           allGKeys, gIdxOf, gActI, repList, repOrbitPairs, pairsArr,
           pairToLeafSrc,
@@ -843,17 +869,16 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
     (* ============================================================
        PHASE 2 — Region enumeration via arrangement BFS
        ============================================================
-       Replaces exhaustive 2^k enumeration with O(T×k) BFS over the
-       hyperplane arrangement adjacency graph, where T is the number
-       of real cells (feasible regions).
-
-       Key guarantee: the d-dimensional cells of any hyperplane
-       arrangement are connected under facet-adjacency (cells sharing a
-       codimension-1 face differ in exactly one sign bit).  Therefore
-       BFS from any starting cell reaches ALL cells, visiting each
-       exactly once.  Total FindInstance calls <= T x k.
+       If precomputedChambers are provided (e.g., from the D4 EBE
+       check which ran Phase 2 over the same hyperplane arrangement),
+       reuse them directly and skip Phase 2.  This halves the total
+       FindInstance cost when D4 and DB conditions are the same set.
        ============================================================ *)
     feasibleRegions = {};
+    If[precomputedChambers =!= {},
+      feasibleRegions = precomputedChambers;
+      Print["  EBE: ", Length[feasibleRegions],
+            " feasible region(s) (reused from D4 EBE check)"],
     If[k == 0 || Length[allSymParams] == 0,
       (* No Piecewise conditions: single trivial region *)
       feasibleRegions = {{Table[1, {k}], {}}};
@@ -884,7 +909,7 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
                 visitedSigmas[sigma2] = None]],
             {i, k}]];
         Print["  EBE: ", Length[feasibleRegions], " feasible region(s)  (",
-              Length[visitedSigmas], " sign patterns visited via BFS)"]]];
+              Length[visitedSigmas], " sign patterns visited via BFS)"]]]];
 
     (* ============================================================
        PHASE 3 — Exact DB check for each feasible region
@@ -1058,6 +1083,220 @@ $dbcCheckRotational[repLeaves_Association, repToOrbitMap_Association,
     {nReps}];
 
     <|"pass" -> (violations === {}), "violations" -> violations|>]
+
+
+(* ================================================================
+   SECTION 7e — ROTATIONAL INVARIANCE CHECK (algebraic, EBE-based)
+   ================================================================
+   Replaces the numerical $dbcCheckRotational with an exact check:
+
+   Phase 1: collect all Piecewise branch conditions from repLeaves
+             (identical to EBE DB check Phase 1).
+   Phase 2: enumerate all feasible parameter regions via arrangement
+             BFS (identical to EBE DB check Phase 2).
+   Phase 3: within each region, substitute J* to resolve Piecewise,
+             then for each communicating pair (s,t) and each non-identity
+             D4 element R check:
+
+               $dbcIsExpZero[ T(s->t) - T(R·s -> R·t) ] === True
+
+             T(s->t) is the sum of leaf weights from s to t — it may
+             contain Exp[-beta * rational] terms from Metropolis
+             acceptance, but those cancel exactly between T(s->t) and
+             T(R·s->R·t) when the energy is D4-invariant.  Any
+             non-cancellation signals a genuine D4 violation.
+
+   Falls back to numerical $dbcCheckRotational when k > ebeMaxK.
+
+   Input: repLeaves/repToOrbitMap from the TRANSLATION-ONLY BFS.
+   ================================================================ *)
+
+$dbcEBECheckD4[repLeaves_Association, repToOrbitMap_Association,
+               allStates_List, nGrid_Integer,
+               allSymParams_List, rotIdxsToCheck_List,
+               ebeMaxK_Integer : 50,
+               numFallbackReps_Integer : 5] :=
+  Module[{nStates, stateToIdx, allGKeys, gIdxOf, gActI,
+          repList, repOrbitPairs, pairsArr, pairToLeafSrc,
+          allLeaves, allConds, k,
+          feasibleRegions, sigma, constraints, jStar,
+          bfsQueue, visitedSigmas, sigma2, constraints2, jStar2,
+          violations, done,
+          jStarAssign, wVals, leafSrcs, tij, tRiRj, expr,
+          rotAct, rsi, rsj},
+
+    nStates    = Length[allStates];
+    stateToIdx = AssociationThread[allStates -> Range[nStates]];
+
+    (* ---- G-action table (translation orbits) ---- *)
+    allGKeys = DeleteDuplicates @ Flatten[Values /@ Values[repToOrbitMap], 1];
+    gIdxOf   = AssociationThread[allGKeys -> Range[Length[allGKeys]]];
+    gActI    = Table[0, {Length[allGKeys]}, {nStates}];
+    Do[With[{gi = gIdxOf[g]},
+       Do[gActI[[gi, si]] =
+            stateToIdx[$dbcApplyGElem[g, allStates[[si]], nGrid]],
+          {si, nStates}]],
+       {g, allGKeys}];
+
+    repList = Keys[repLeaves];
+    repOrbitPairs = Table[
+      With[{repKey = repList[[ri]],
+            orbitMap = repToOrbitMap[repList[[ri]]]},
+        Table[
+          With[{tgtIdx = stateToIdx[repLeaves[repKey][[li, 2]]]},
+            Map[Function[sKey,
+                {stateToIdx[sKey],
+                 gActI[[gIdxOf[orbitMap[sKey]], tgtIdx]]}],
+              Keys[orbitMap]]],
+          {li, Length[repLeaves[repKey]]}]],
+      {ri, Length[repList]}];
+
+    pairsArr = DeleteDuplicates @ Sort @ Map[Sort,
+      Flatten[repOrbitPairs, 2]];
+    pairsArr = Select[pairsArr, #[[1]] =!= #[[2]] &];
+
+    (* pairToLeafSrc[{src,tgt}] = {{ri,li},...} *)
+    pairToLeafSrc = <||>;
+    Do[
+      Scan[Function[st,
+        With[{key = {st[[1]], st[[2]]}},
+          pairToLeafSrc[key] =
+            Append[Lookup[pairToLeafSrc, Key[key], {}], {ri, li}]]],
+        repOrbitPairs[[ri, li]]],
+      {ri, Length[repList]},
+      {li, Length[repOrbitPairs[[ri]]]}];
+
+    (* ---- Rotation action table ---- *)
+    rotAct = Table[
+      With[{g = <|"rot" -> rotIdxsToCheck[[ri]], "dr" -> 0, "dc" -> 0|>},
+        Table[stateToIdx[$dbcApplyGElem[g, allStates[[si]], nGrid]],
+              {si, nStates}]],
+      {ri, Length[rotIdxsToCheck]}];
+
+    (* ============================================================
+       PHASE 1 — Extract distinct Piecewise conditions
+       ============================================================ *)
+    allLeaves = Flatten[Values[repLeaves], 1];
+    allConds = DeleteDuplicates @ Select[
+      Flatten @ Map[Function[lf,
+        Cases[lf[[3]],
+              HoldPattern[Piecewise[cl_List, _]] :>
+                (#[[2]] & /@ Select[cl, Length[#] == 2 &]),
+              Infinity]],
+        allLeaves],
+      Function[c,
+        MatchQ[c, _Less | _LessEqual | _Greater | _GreaterEqual] &&
+        !FreeQ[c, Alternatives @@ allSymParams]]];
+    k = Length[allConds];
+
+    Print["  D4 EBE: k=", k, " branch condition(s)"];
+
+    (* ---- Fallback when k is too large ---- *)
+    If[k > ebeMaxK,
+      Print["  D4 EBE: k=", k, " exceeds ebeMaxK=", ebeMaxK,
+            " — falling back to SZ (", numFallbackReps, " points)"];
+      (* SZ-style numerical fallback: same as $dbcCheckRotational *)
+      Return[Append[$dbcCheckRotational[
+               repLeaves, repToOrbitMap, allStates, nGrid,
+               allSymParams, rotIdxsToCheck, numFallbackReps],
+                    "ebe" -> False, "chambers" -> {}]]];
+
+    (* ============================================================
+       PHASE 2 — Region enumeration via arrangement BFS
+       ============================================================ *)
+    feasibleRegions = {};
+    If[k == 0 || Length[allSymParams] == 0,
+      feasibleRegions = {{Table[1, {k}], {}}};
+      Print["  D4 EBE: 1 feasible region (no branch conditions)"],
+      jStar = Quiet[FindInstance[True, allSymParams, Rationals, 1]];
+      If[jStar === {} || jStar === {{}},
+        feasibleRegions = {{Table[1, {k}], {}}};
+        Print["  D4 EBE: 1 feasible region (fallback)"],
+        jStar = First[jStar];
+        sigma = Table[If[TrueQ[allConds[[i]] /. jStar], 1, 0], {i, k}];
+        visitedSigmas = <|sigma -> jStar|>;
+        feasibleRegions = {{sigma, jStar}};
+        bfsQueue = {sigma};
+        While[bfsQueue =!= {},
+          sigma = First[bfsQueue]; bfsQueue = Rest[bfsQueue];
+          Do[
+            sigma2 = ReplacePart[sigma, i -> 1 - sigma[[i]]];
+            If[!KeyExistsQ[visitedSigmas, sigma2],
+              constraints2 = And @@ Table[
+                If[sigma2[[j]] == 1, allConds[[j]], !allConds[[j]]], {j, k}];
+              jStar2 = Quiet[FindInstance[constraints2, allSymParams, Rationals, 1]];
+              If[jStar2 =!= {} && jStar2 =!= {{}},
+                visitedSigmas[sigma2] = First[jStar2];
+                AppendTo[feasibleRegions, {sigma2, First[jStar2]}];
+                AppendTo[bfsQueue, sigma2],
+                visitedSigmas[sigma2] = None]],
+            {i, k}]];
+        Print["  D4 EBE: ", Length[feasibleRegions], " feasible region(s)  (",
+              Length[visitedSigmas], " sign patterns visited)"]]];
+
+    (* ============================================================
+       PHASE 3 — Exact D4 symmetry check per feasible region
+       ============================================================
+       For each region and each communicating pair (i,j), check that
+       T(i->j) = T(R·i -> R·j) for all D4 elements R.
+       T(i->j) is a sum of (possibly Exp-containing) leaf weights;
+       the difference is checked exactly by $dbcIsExpZero.
+       ============================================================ *)
+    violations = {};
+    done = False;
+
+    Do[
+      If[done, Break[]];
+      {sigma, jStarAssign} = feasibleRegions[[rgn]];
+
+      wVals = Table[
+        repLeaves[repList[[rj]]][[All, 3]] /. jStarAssign,
+        {rj, Length[repList]}];
+
+      Do[
+        If[done, Break[]];
+        With[{i = pair[[1]], j = pair[[2]]},
+
+          (* T(i->j): sum leaf weights from i to j *)
+          leafSrcs = Lookup[pairToLeafSrc, Key[{i, j}], {}];
+          tij = If[leafSrcs === {}, 0,
+                   Total[wVals[[#[[1]], #[[2]]]] & /@ leafSrcs]];
+
+          Do[
+            If[done, Break[]];
+            rsi = rotAct[[ri, i]]; rsj = rotAct[[ri, j]];
+
+            (* T(R·i -> R·j): sum leaf weights from R·i to R·j *)
+            leafSrcs = Lookup[pairToLeafSrc, Key[{rsi, rsj}], {}];
+            tRiRj = If[leafSrcs === {}, 0,
+                       Total[wVals[[#[[1]], #[[2]]]] & /@ leafSrcs]];
+
+            If[tij === 0 && tRiRj === 0, Continue[]];
+
+            expr = Expand[tij - tRiRj];
+            If[expr === 0, Continue[]];
+
+            If[$dbcIsExpZero[expr] =!= True,
+              AppendTo[violations,
+                <|"rot"   -> rotIdxsToCheck[[ri]],
+                  "s"     -> allStates[[i]],
+                  "t"     -> allStates[[j]],
+                  "Tst"   -> tij,
+                  "TRsRt" -> tRiRj,
+                  "region"-> sigma|>];
+              If[Length[violations] >= 5, done = True; Break[]]],
+
+            {ri, Length[rotIdxsToCheck]}]],
+
+        {pair, pairsArr}],
+
+      {rgn, Length[feasibleRegions]}];
+
+    (* Return feasibleRegions so the DB EBE check can reuse them,
+       avoiding a duplicate Phase 2 (FindInstance) enumeration. *)
+    <|"pass" -> (violations === {}), "violations" -> violations,
+      "ebe" -> True,
+      "chambers" -> feasibleRegions|>]
 
 
 (* ================================================================
