@@ -1,0 +1,792 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{mdframed}
+\usepackage{mathtools}
+
+\geometry{margin=2.5cm}
+
+\lstset{
+  basicstyle=\small\ttfamily,
+  breaklines=true,
+  frame=single,
+  language=Mathematica,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  backgroundcolor=\color{gray!5}
+}
+
+\newtheoremstyle{critical}{}{}{\itshape}{}{\bfseries\color{red}}{.}{ }{}
+\theoremstyle{critical}
+\newtheorem{issue}{Issue}
+
+\newtheoremstyle{remark}{}{}{}{}{\bfseries}{.}{ }{}
+\theoremstyle{remark}
+\newtheorem{rem}{Remark}
+\newtheorem{claim}{Claim}
+
+\title{\textbf{Critical Audit of SZ-DBC:\\Detailed Balance Checker for Lattice MCMC}\\[1ex]
+\large A referee-style review of correctness, completeness, and rigor}
+\author{Independent Technical Review}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%===============================================================
+\section{Overview and Scope}
+%===============================================================
+
+SZ-DBC is a software tool that automatically verifies detailed balance for lattice MCMC
+algorithms. The checker intercepts random-number calls during a symbolic BFS, builds
+a symbolic transition matrix, and then checks the detailed balance condition
+\begin{equation}
+T(s \to t)\,\pi(s) = T(t \to s)\,\pi(t), \qquad \pi(s) \propto e^{-\beta E(s)},
+\label{eq:db}
+\end{equation}
+exactly (EBE mode) or probabilistically (SZ fallback) over all coupling-constant
+parameter regions.
+
+This report presents a systematic audit of every step of the pipeline. All claims were
+verified by reading the source code (\texttt{dbc\_core.wl}, \texttt{check.wls}) and by
+running targeted experiments using the Mathematica kernel. The findings are ordered
+roughly by severity.
+
+\begin{mdframed}[backgroundcolor=red!8,linecolor=red!60!black,linewidth=1pt]
+\textbf{Bottom line.} The checker is broadly sound but contains one
+\emph{correctness-critical} bug (Section~\ref{sec:weightbug}) and one
+\emph{design weakness} that can produce false results in ways not disclosed to the user
+(Section~\ref{sec:taufail}). The D4 check is numerical and probabilistic; a rigorous
+algebraic alternative exists and is described in Section~\ref{sec:d4symbolic}.
+Several minor issues are documented in Sections~\ref{sec:minor} and~\ref{sec:doc}.
+\end{mdframed}
+
+%===============================================================
+\section{The BFS Engine and Transition Weight Calculation}
+\label{sec:weightbug}
+%===============================================================
+
+\subsection{Background: How Weights Are Assigned}
+
+The BFS engine (\texttt{RunWithBitsAT}) replaces all random-number calls with symbolic
+tokens. For \texttt{RandomReal[]}, it uses an interval-tracking scheme: each call
+creates a fresh token $U_j$ representing a uniform on $[0,1]$. When the code compares
+$U_j < p$, a new bit $b$ is read from the bit-string. If $b=1$ the interval narrows to
+$[0, p]$ and the path weight is multiplied by $p/(1-0) = p$; if $b=0$ the interval becomes
+$[p,1]$ and weight is multiplied by $1-p$. After the algorithm terminates, the leaf weight
+equals the probability of having followed that exact bit sequence given the coupling
+constants and $\beta$.
+
+For \texttt{RandomChoice[list]} with $n = \texttt{Length[list]}$, the code reads
+$k = \lceil \log_2 n \rceil$ bits and computes \texttt{val} $\in \{0,\ldots, 2^k-1\}$.
+If \texttt{val} $\geq n$ the path is discarded as \texttt{\$dbc\$outOfRange}; otherwise
+the element \texttt{list[[val+1]]} is chosen. Each bit read multiplies the current weight
+by $\tfrac{1}{2}$. For an $n$-element list, the resulting weight per valid leaf is
+$\left(\tfrac{1}{2}\right)^k$.
+
+\subsection{The Bug}
+
+\begin{issue}[Incorrect weights for non-power-of-2 selection pools]
+\label{issue:weight}
+When $n$ is not a power of~2, the BFS assigns weight $\tfrac{1}{2^k}$ to each
+outcome, whereas the actual probability is $\tfrac{1}{n}$. This is a systematic
+relative error of
+\[
+  \frac{1/2^k}{1/n} = \frac{n}{2^k} \neq 1 \qquad \text{when } n \text{ is not a power of } 2.
+\]
+This was verified empirically: \texttt{RandomChoice[\{a,b,c\}]} ($n=3$, $k=2$) produces
+three leaves each with weight $\tfrac{1}{4}$, summing to $\tfrac{3}{4}$, not~$1$.
+\end{issue}
+
+The following output was obtained from a direct call to \texttt{RunWithBitsAT}:
+\begin{lstlisting}
+bits={0,0}  result={10, 1/4}    (* should be 1/3 *)
+bits={0,1}  result={20, 1/4}
+bits={1,0}  result={30, 1/4}
+bits={1,1}  result=$dbc$outOfRange
+Weight sum: 3/4   (* should be 1 *)
+\end{lstlisting}
+
+\subsection{When Does This Affect the DB Check?}
+
+The detailed balance check evaluates
+$T(s\to t)\,e^{-\beta E_s} - T(t\to s)\,e^{-\beta E_t} = 0$.
+If both $T(s\to t)$ and $T(t\to s)$ incur the \emph{same} multiplicative error
+$\alpha = n/2^k$, the condition becomes
+$\alpha\,T_\text{true}(s\to t)\,e^{-\beta E_s} = \alpha\,T_\text{true}(t\to s)\,e^{-\beta E_t}$,
+which is equivalent to the correct condition. Hence the bug is harmless whenever
+the selection-pool size is the same in both directions.
+
+However, if the forward and reverse transitions use selection pools of \emph{different}
+non-power-of-2 sizes $n_f$ and $n_r$, the BFS assigns:
+\[
+T_\text{BFS}(s\to t) = T_\text{true}(s\to t)\cdot \frac{n_f}{2^{k_f}}, \quad
+T_\text{BFS}(t\to s) = T_\text{true}(t\to s)\cdot \frac{n_r}{2^{k_r}}.
+\]
+The checker evaluates the \emph{BFS} detailed balance condition:
+\[
+T_\text{true}(s\to t)\cdot \frac{n_f}{2^{k_f}}\,e^{-\beta E_s}
+= T_\text{true}(t\to s)\cdot \frac{n_r}{2^{k_r}}\,e^{-\beta E_t}.
+\]
+This differs from the \emph{true} detailed balance condition by the factor
+$\frac{n_f/2^{k_f}}{n_r/2^{k_r}}$. When this ratio is not~$1$, the checker operates
+on a shifted DB condition and can produce both false positives and false negatives.
+
+\textbf{Concrete false-pass example.} Consider two states $s_1$ and $s_2$ with
+\emph{equal} energies $E(s_1) = E(s_2) = 0$.  An algorithm proposes
+$s_1 \to s_2$ by selecting uniformly from a 3-element list ($n_f = 3$, $k_f = 2$,
+$\alpha_f = 3/4$), and proposes $s_2 \to s_1$ from a 4-element list ($n_r = 4$,
+$k_r = 2$, $\alpha_r = 1$, a power of~2, no error). True probabilities:
+$T_\text{true}(s_1 \to s_2) = 1/3$, $T_\text{true}(s_2 \to s_1) = 1/4$.
+
+With equal energies, true DB requires $T(s_1\to s_2) = T(s_2\to s_1)$,
+i.e.\ $1/3 = 1/4$, which is \emph{false}. The algorithm violates detailed balance.
+
+The BFS assigns $T_\text{BFS}(s_1\to s_2) = 1/4$ (three leaves at weight $1/4$ each)
+and $T_\text{BFS}(s_2\to s_1) = 1/4$ (four leaves at weight $1/4$ each). The BFS
+DB condition becomes $1/4 \cdot e^{0} = 1/4 \cdot e^{0}$, i.e.\ $1/4 = 1/4$, which
+is \emph{true}. The checker reports \textbf{PASS for a broken algorithm}.
+
+More generally, if $n_f = 3$ (forward) and $n_r = 5$ (reverse):
+\begin{itemize}
+\item BFS factor ratio: $(n_f/2^{k_f}) / (n_r/2^{k_r}) = (3/4)/(5/8) = 6/5 \neq 1$.
+\item The checker checks the wrong DB condition, shifted by factor $6/5$.
+\end{itemize}
+
+\textbf{Impact on the provided examples.} In all provided examples
+(\texttt{single\_metropolis.wl}, \texttt{kawasaki.wl}, \texttt{vmmc\_2d.wl}),
+the selection pool sizes are:
+\begin{itemize}
+\item Particle selection: $n=3$ (always 3 particles) $\Rightarrow k=2$, $\alpha=3/4$ in both directions.
+\item Direction selection: $n=8$ (power of~2) $\Rightarrow$ no error.
+\end{itemize}
+The factor $\alpha=3/4$ cancels between forward and reverse, so the DB results for the
+provided examples are correct despite the bug. However, the bug is a latent correctness
+defect for algorithms where selection-pool size varies between forward and reverse
+transitions---precisely the class of Metropolis-Hastings algorithms with asymmetric
+proposals.
+
+\subsection{The Fix}
+
+The correct weight for a valid outcome of \texttt{RandomChoice[list]} with $n$ elements
+is $1/n$. The BFS should renormalize the weight after reading $k$ bits:
+\begin{lstlisting}
+(* After choosing outcome: multiply weight by 2^k / n to renormalize *)
+weight *= (2^k / n);
+\end{lstlisting}
+This converts the $1/2^k$ per-leaf weight to $1/n$, giving correct absolute
+probabilities and making the DB check valid for all algorithms regardless of whether $n$
+is a power of~2.
+
+An equivalent fix: for \texttt{RandomChoice[list]}, instead of the rejection-sampling
+approach (read $k=\lceil\log_2 n\rceil$ bits, discard if out of range), use the
+interval-tracking approach analogous to \texttt{RandomReal[]}. Partition $[0,1]$ into $n$
+equal intervals; use a single real token $U$ with sequentially refined bits to identify
+which interval $U$ falls in. The resulting leaf weight is exactly $1/n$. This is in fact
+what the \texttt{seqBernoulli} function does for weighted \texttt{RandomChoice}, but the
+unweighted case skips this and goes directly to bit-reading.
+
+%===============================================================
+\section{The D4 Rotational Invariance Check}
+\label{sec:d4}
+%===============================================================
+
+\subsection{Current Implementation}
+
+The D4 check (Section 7d of \texttt{dbc\_core.wl}) verifies that
+$T(s\to t) = T(R\cdot s \to R\cdot t)$ for all D4 elements $R$ and communicating pairs
+$(s,t)$, by evaluating both sides numerically at \texttt{nReps} $\in [5,10]$ random
+coupling-constant points and checking $|T(s\to t) - T(R\cdot s \to R\cdot t)| < 10^{-6}$
+(relative).
+
+This is a probabilistic check. As acknowledged in the README, it can in principle produce
+false positives (declaring D4 when it does not hold) or false negatives (declaring no D4
+when it does hold), though both are claimed to be negligibly unlikely in practice.
+
+\subsection{False-Positive Risk}
+
+The risk of a false positive deserves careful analysis. The entries
+$T(s\to t)$ and $T(R\cdot s\to R\cdot t)$ are rational functions of the coupling
+constants (after EBE region fixation). Their difference $\Delta(J) = T(s\to t) -
+T(R\cdot s\to R\cdot t)$ is a nonzero rational function for a genuinely asymmetric
+algorithm. The zero set $\{\Delta = 0\}$ has measure zero in coupling-constant space,
+so random points will lie outside it with probability~$1$ (for exact arithmetic).
+
+With floating-point tolerance $10^{-6}$, a false positive occurs if
+$|\Delta(J_i)| < 10^{-6} \cdot \max(|T(s\to t)|, |T(R\cdot s\to R\cdot t)|, 10^{-30})$
+at all $\texttt{nReps}$ test points. This requires either:
+\begin{enumerate}
+\item The violation $\Delta$ to be uniformly very small (nearly symmetric algorithm), or
+\item All random coupling points to lie near the zero surface by coincidence.
+\end{enumerate}
+For algorithms that are ``accidentally close'' to D4 (e.g., D4 violated only via a
+small perturbation term), the violation could be smaller than the tolerance $10^{-6}$ at
+all 10 test points, producing a false positive. Such an algorithm would then have its
+orbits incorrectly reduced from 56 to 8 representatives, causing the subsequent DB
+check to operate on an incorrect (smaller) transition graph.
+
+\textbf{Consequence of a false positive in D4.} If the D4 check incorrectly declares
+symmetry, the orbit reduction from 56 to 8 representatives is unwarranted. The DB
+check then runs on 8-rep BFS output and constructs the full T matrix via the false D4
+symmetry assumption. States that are not in the same D4-orbit but happen to be related
+by the incorrectly applied group action will have their transition probabilities conflated.
+The DB check may report PASS when detailed balance is in fact violated in the
+non-symmetric part of the parameter space.
+
+\subsection{Why the Translational $\tau$-Trick Cannot Be Directly Adapted for D4}
+\label{sec:d4symbolic}
+
+The translational invariance check works by augmenting all particle positions with a
+symbolic offset $\tau = (\tau_r, \tau_c)$:
+\[
+p_i \;\mapsto\; p_i + \tau.
+\]
+In a translation-invariant algorithm, all spatial operations use \emph{pairwise
+differences}:
+\[
+(p_i + \tau) - (p_j + \tau) = p_i - p_j,
+\]
+so $\tau$ cancels algebraically from every transition probability. Running the BFS once
+from a $\tau$-augmented state, and checking that no leaf weight contains $\tau$, certifies
+translation invariance for the entire state space.
+
+For D4, an analogous augmentation would require a symbolic rotation $R$ such that:
+\[
+p_i \;\mapsto\; R\,p_i,
+\]
+and the algorithm's outputs should satisfy $T(R\cdot s \to R\cdot t) = T(s \to t)$.
+The fundamental obstacle to the $\tau$-style algebraic trick is that D4 is a
+\emph{discrete, non-additive} group:
+
+\begin{enumerate}
+\item \textbf{Discreteness.} The D4 group has exactly 8 elements. There is no continuous
+  parameter interpolating between them. The translation group, in contrast, acts via a
+  continuous offset $\tau \in \mathbb{R}^2$, which can be introduced as a symbolic
+  variable.
+
+\item \textbf{Non-additivity.} Translation acts \emph{additively}: $p \mapsto p + \tau$.
+  This means $\tau$ enters positions linearly and is canceled by subtraction. D4
+  rotations act \emph{multiplicatively} via $2\times 2$ matrices:
+  $p \mapsto R\,p$. Even if one introduces a symbolic rotation matrix
+  $\mathbf{R}(\theta)$ parameterized by an angle $\theta$, the constraint that $\theta$
+  takes only the values $\{0, 90, 180, 270\}$ degrees means the cancellation is not
+  algebraic over the reals---it would require verifying $T(\mathbf{R}\,s \to
+  \mathbf{R}\,t) = T(s \to t)$ for each of 8 specific choices of $\mathbf{R}$, which is
+  no simpler than the original problem.
+
+\item \textbf{Distance invariance.} For isotropic interactions, the pairwise energy
+  satisfies $E(R\cdot s) = E(s)$ because $|R\,p_i - R\,p_j|^2 = |p_i - p_j|^2$. One
+  might hope to exploit this algebraically. However, the \emph{transition probabilities}
+  also depend on the order in which particles are processed (e.g., which particle is
+  selected first by \texttt{RandomChoice[state]}), and this ordering is not preserved by
+  D4 rotations unless the algorithm is carefully written to use a canonical ordering.
+  Verifying algebraically that the ordering is canonical under all D4 actions is itself
+  a non-trivial problem.
+\end{enumerate}
+
+\subsection{A Rigorous Algebraic D4 Check via EBE Extension}
+
+Although the $\tau$-style trick cannot be directly applied, a \emph{fully rigorous
+algebraic check} is achievable by extending the existing EBE machinery. The key
+observation is that after EBE Phase~2 (arrangement BFS enumerating all parameter
+regions), the transition weights $T(s\to t)$ are known as exact rational numbers within
+each region. The D4 symmetry condition $T(s\to t) = T(R\cdot s \to R\cdot t)$ then
+reduces to a finite set of exact rational comparisons.
+
+\textbf{Proposed algorithm:}
+\begin{enumerate}
+\item Run the translation-only BFS (already done in Step~5 of the current pipeline).
+\item Run EBE Phase~1 and Phase~2 (already done in the DB check) to enumerate all $T$
+  feasible parameter regions with rational representatives $J^*$.
+\item For each of the $T$ regions, substitute $J^*$ into all leaf weights
+  (already done in EBE Phase~3). This yields exact rational values for every
+  $T_\text{BFS}(s\to t)$.
+\item For each communicating pair $(s,t)$ and each of the 7 non-identity D4 elements $R$:
+  check whether $T(s\to t) = T(R\cdot s \to R\cdot t)$ as an exact rational equality.
+\item If all equalities hold across all $T$ regions and all 7 D4 elements, D4 symmetry
+  is algebraically certified.
+\end{enumerate}
+
+This approach has cost $O(T \times 7 \times |\text{pairs}|)$ rational comparisons,
+which is comparable to (and no more expensive than) the DB check itself. It would
+replace the 10-point numerical check with an exact certificate.
+
+A further simplification is possible: the DB check for correctness already enumerates
+all regions. The D4 check can piggyback on this enumeration at negligible marginal cost.
+
+%===============================================================
+\section{The $\tau$-BFS: Actual Failure Modes}
+\label{sec:taufail}
+%===============================================================
+
+\subsection{What the $\tau$-BFS Detects}
+
+The translational invariance check augments every particle position with
+$(\tau_r, \tau_c)$ and runs the BFS. If any leaf weight contains $\tau_r$ or $\tau_c$,
+the algorithm is declared translation-non-invariant. This is correct and sound when
+the algorithm returns to the BFS normalizer (\texttt{\$dbcNormTauState}) cleanly.
+
+\subsection{Internal Mathematica Calls to \texttt{RandomInteger} Cause Spurious Errors}
+\label{sec:taufail:internalRNG}
+
+The BFS engine uses \texttt{Block[\{RandomInteger = ...\}]} to intercept all calls to
+\texttt{RandomInteger}. This global interception catches \emph{all} evaluations of
+\texttt{RandomInteger} in the dynamic scope, including internal calls made by Mathematica's
+own kernel during symbolic evaluation.
+
+In \texttt{quadratic\_field.wl}, the algorithm normalizes positions internally:
+\begin{lstlisting}
+newPosNorm = {Mod[newPos[[1]]-1, n]+1, Mod[newPos[[2]]-1, n]+1};
+\end{lstlisting}
+When the $\tau$-augmented position $p_i + \tau$ flows through this line, the argument of
+\texttt{Mod} becomes $r + \tau_r + \Delta r - 1$, a symbolic expression. Mathematica's
+\texttt{PiecewiseExpand} (called by \texttt{acceptTestI} on the symbolic $\Delta E$)
+internally invokes \texttt{RandomInteger[\{-16, 16\}, n]} to sample from a distribution
+over integer residue classes during its symbolic simplification of \texttt{Mod}. This
+internal call is intercepted by the BFS's \texttt{Block}, does not match any handled
+form, and throws:
+\begin{lstlisting}
+$dbc$cantHandle["RandomInteger[{{-16, 16}, 4}]"]
+\end{lstlisting}
+
+The summary line correctly reports ``Translational: FAIL (recomputed without)'', and the
+subsequent DB check is correct. However, the detection mechanism is \emph{not} the
+intended $\tau$-cancellation check; the BFS merely errored out. The README description
+``$\tau$-check detects the non-invariant field'' is misleading: $\tau$ was never
+\emph{detected} in any leaf weight. The algorithm fell through to the error path.
+
+\begin{issue}[Incorrect $\tau$-detection for quadratic\_field]
+The $\tau$-BFS for \texttt{quadratic\_field.wl} reports ``FAIL'' via a
+\texttt{\$dbc\$cantHandle} error (internal Mathematica RNG call intercepted), not via the
+designed mechanism of detecting $\tau_r$ or $\tau_c$ in leaf weights. The end-state is
+correct (orbit recomputation without translation), but the diagnostics are wrong and the
+robustness of the check is lower than claimed.
+\end{issue}
+
+This also reveals a design fragility: any algorithm whose evaluation path (when
+$\tau$-augmented) causes Mathematica to call \texttt{RandomInteger} internally will
+trigger a spurious cantHandle error. The $\tau$-BFS cannot distinguish between
+(a)~the user's algorithm calling \texttt{RandomInteger} as part of its logic, and
+(b)~Mathematica's kernel calling \texttt{RandomInteger} during symbolic evaluation.
+
+\subsection{The $\tau$-Check from Orbit Representatives Is Sound}
+
+The claim that checking $\tau$-freedom from translation-orbit representatives is
+equivalent to checking from all states is \emph{correct} and the argument is rigorous.
+For any state $s = T_{dr,dc}(\text{rep})$, running the algorithm from $s + \tau =
+T_{dr,dc}(\text{rep}) + \tau = T_{dr+\tau_r, dc+\tau_c}(\text{rep})$ is equivalent to
+running from $\text{rep}$ with a shifted $\tau$-offset $\tau' = \tau + (dr, dc)$. Since
+$dr, dc$ are concrete integers that appear only in $\tau' = \tau + \text{integer}$, and
+$\tau$ is free, the $\tau$-BFS output for rep subsumes the output for $s$. If $\tau$
+cancels for rep at any offset, it cancels for rep at all offsets.
+
+\subsection{The $\tau$-Check Verifies Weights But Not Next-State Consistency}
+
+The check tests only \texttt{FreeQ[leaf[[3]], $\tau_r$] \&\& FreeQ[leaf[[3]], $\tau_c$]}.
+It does not directly verify that the next state \texttt{leaf[[2]]} is the correct
+$\tau$-shifted version of the non-augmented next state. For physically sensible
+algorithms the weight condition is equivalent to translation invariance. For
+pathological algorithms (position-dependent weights that happen to be $\tau$-free,
+combined with non-translation-invariant next-state selection), the check could yield a
+false pass. This edge case is not physical but should be acknowledged.
+
+%===============================================================
+\section{The Ergodicity Check}
+\label{sec:ergodicity}
+%===============================================================
+
+\begin{issue}[Ergodicity BFS starts from allStates[[1]], not \$seedState]
+\label{issue:ergoseed}
+In \texttt{\$dbcCheckErgodicityFromLeaves}, the BFS always starts from state index~1:
+\begin{lstlisting}
+(* BFS from state index 1 (first enumerated state = seed) *)
+reachableSet = <|1 -> True|>;
+queue = {1};
+\end{lstlisting}
+The comment assumes that \texttt{allStates[[1]] == \$seedState}. This holds for the
+standard seed-state construction (first $N$ lexicographic positions with sorted types)
+because \texttt{\$dbcEnumerateNParticleStates} generates states in the same order. For
+any user-defined \texttt{\$seedState} that is not the lexicographically first $N$-particle
+state, the ergodicity BFS checks reachability from the wrong starting state.
+\end{issue}
+
+This is a latent defect. For all provided examples, it is accidentally correct. The fix
+is to pass \texttt{seedState} as a parameter to \texttt{\$dbcCheckErgodicityFromLeaves}
+and look up its index in \texttt{stateToIdx}.
+
+%===============================================================
+\section{The EBE Exact Check}
+\label{sec:ebe}
+%===============================================================
+
+\subsection{Correctness of the Arrangement BFS}
+
+The EBE Phase~2 uses a BFS over the face-adjacency graph of the hyperplane arrangement
+defined by the $k$ Piecewise branch conditions. The correctness relies on:
+
+\begin{claim}[Connectivity of hyperplane arrangement chambers]
+The open chambers (full-dimensional cells) of any arrangement of finitely many
+hyperplanes in $\mathbb{R}^d$ with rational coefficients form a connected graph under
+facet-adjacency (two chambers are adjacent iff they share a codimension-1 face).
+\end{claim}
+
+This claim is \emph{correct}. The standard proof: given any two chambers $C_1$ and
+$C_2$, connect any interior point of $C_1$ to any interior point of $C_2$ by a line
+segment. The segment crosses a sequence of hyperplanes, and each crossing moves to an
+adjacent chamber. The resulting sequence of chambers is a path in the adjacency graph
+from $C_1$ to $C_2$.
+
+Furthermore, for rational-coefficient hyperplanes, every chamber contains a rational
+point. This guarantees that \texttt{FindInstance[\ldots, Rationals]} will find a
+representative for every feasible region (non-empty chamber). The BFS therefore visits
+every real chamber.
+
+\subsection{Strict Inequalities and Boundary Omission}
+
+The Piecewise conditions in the transition weights use strict inequalities
+(\texttt{<}, not \texttt{<=}). The EBE arrangement BFS therefore enumerates only the
+open chambers and does not test the $(d-1)$-dimensional boundaries where two or more
+conditions are simultaneously active.
+
+A coupling configuration on a boundary (e.g., $J_1 = J_2$ exactly) corresponds to
+a degenerate energy landscape. For a DB violation to exist \emph{only} on such a boundary
+but not in either adjacent open chamber, the violation would need to be
+parametric---holding for a measure-zero subset of parameter space.
+
+For Metropolis-type algorithms, this cannot happen: within each open chamber, $T(s\to t)$
+is a specific rational multiple of $e^{-\beta\Delta E}$ and $T(t\to s)$ is a rational
+number or a different Boltzmann factor. By continuity, a violation in an open chamber
+extends to the boundary of that chamber. Since EBE checks all open chambers, any
+violation that extends to an open neighborhood will be detected.
+
+The argument breaks for algorithms with \emph{discontinuous} transition rules (e.g., a
+rule that is applied only when $J_1 = J_2$ exactly), but such algorithms have measure-zero
+probability in practice. This should be documented explicitly.
+
+\subsection{Correctness of \texttt{\$dbcIsExpZero}}
+
+The function checks whether a symbolic expression of the form
+$\sum_i c_i e^{-\beta E_i}$ is identically zero (for symbolic $\beta > 0$, rational
+$c_i$ and $E_i$). The method:
+\begin{enumerate}
+\item \texttt{\$dbcMergeExp}: merge products $e^{x} e^{y} \to e^{x+y}$ using
+  \texttt{FixedPoint} with up to 30 iterations.
+\item \texttt{\$dbcSplitTerm}: split each term into (rational coefficient, exponent).
+\item \texttt{\$dbcGroupByExp}: group terms by exponent using
+  \texttt{Expand[\ldots] === 0}.
+\item Check that the sum of rational coefficients in each exponent group is zero.
+\end{enumerate}
+
+This is \emph{correct} for the specific structure arising in Metropolis-type algorithms
+(rational coupling constants substituted via $J^*$, $\beta$ remaining symbolic). After
+$J^*$ substitution, all energy values are rational, so all exponents are of the form
+$-\beta \times \text{rational}$.
+
+However, the function returns \texttt{\$dbcFS} (fallback sentinel) when a term has
+multiple non-merged Exp factors or a transcendental coefficient. This sentinel is treated
+as a non-True result:
+\begin{lstlisting}
+If[res =!= True,
+  violations[pair] = <| ... |>]
+\end{lstlisting}
+Any such \texttt{\$dbcFS} result adds a spurious entry to the violations list,
+constituting a \emph{false positive}. The user would be informed of a DB violation
+that is in fact an analysis failure, with no diagnostic distinguishing the two cases.
+
+%===============================================================
+\section{Minor Issues}
+\label{sec:minor}
+%===============================================================
+
+\subsection{Time-Limited BFS Returns Partial Leaves Without Error}
+
+When the per-state time limit \texttt{tlim} is exceeded in
+\texttt{\$dbcBuildStateLeaves}, the function returns whatever leaves have been collected
+so far with only a warning print:
+\begin{lstlisting}
+If[timedOut, Print["  WARNING: time limit reached for state ", state]];
+leaves]
+\end{lstlisting}
+This is a correctness hazard: the subsequent DB check silently operates on an incomplete
+transition matrix. A timed-out BFS should either raise a hard error (like the
+\texttt{maxDepth} case) or the final verdict should be marked as INCONCLUSIVE rather
+than PASS or FAIL.
+
+\subsection{Coupling Symmetry Rule Persists Across Runs in a Live Kernel}
+
+The call \texttt{\$dbcAddCouplingSymmetry[symCouplings]} installs a global rewrite rule
+for the coupling head. If the same kernel processes multiple algorithm files without
+restarting, and the second file has a different coupling structure, residual rules from
+the first run may interfere. The \texttt{check.wls} script calls \texttt{ClearAll} on
+the coupling head before reinstalling, which mitigates this in the script context. Users
+who load \texttt{dbc\_core.wl} interactively should be aware of this issue.
+
+\subsection{The \texttt{seqBernoulli} Weight Calculation Is Correct But Fragile}
+
+The sequential Bernoulli decomposition of \texttt{RandomChoice[weights -> elements]}
+is mathematically correct. However, when \texttt{Total[ws] = 0} (all weights are zero,
+which can occur for Piecewise weight expressions that are zero in the current coupling
+region), division by zero occurs in the computation \texttt{p = ws[[i]] / remainW}.
+This would produce \texttt{ComplexInfinity} or \texttt{Indeterminate}, potentially
+corrupting subsequent computations. No guard is present.
+
+\subsection{The \texttt{RandomVariate[NormalDistribution]} Approximation}
+
+The BFS supports \texttt{RandomVariate[NormalDistribution[$\mu$, $\sigma$]]} by
+discretizing the distribution onto integer values near $\mu$, using
+\texttt{seqBernoulli} with CDF-based weights. The approximation truncates at
+$\texttt{nMax} = \lfloor n_\text{Grid}/2 \rfloor$ above and below $\mu$. For a 3×3
+grid, this is $\pm 1$, which severely underestimates the tails of any distribution with
+$\sigma \geq 1$. The approximation error in the weights is unbounded relative to the
+exact normal distribution. This discretization is not documented and its accuracy is not
+checked.
+
+%===============================================================
+\section{Documentation Inconsistencies}
+\label{sec:doc}
+%===============================================================
+
+\subsection{Help Text vs.\ Code: \texttt{ebeMaxK} Default}
+
+In \texttt{check.wls} (line~19), the usage comment states:
+\begin{lstlisting}
+-ebeMaxK N        Max branch conditions for EBE; falls back to SZ above (default 12)
+\end{lstlisting}
+However, the code at line~48 defaults to 50:
+\begin{lstlisting}
+ebeMaxK = ToExpression[parseOpt["-ebeMaxK", "50"]];
+\end{lstlisting}
+The README correctly documents the default as 50. The comment is wrong and should be
+corrected to avoid user confusion.
+
+\subsection{Description of $\tau$-Failure for \texttt{quadratic\_field.wl}}
+
+The README states: ``Translational: FAIL (recomputed without) $\leftarrow$ field breaks
+$\tau$-invariance; expected.'' The actual mechanism is that the $\tau$-BFS errors out
+with a cantHandle exception (Mathematica's internal \texttt{RandomInteger} call is
+intercepted), not that $\tau$ is detected in leaf weights. The result is the same, but
+the description implies a more principled detection than actually occurs.
+
+\subsection{Claim About False-Positive Probability}
+
+The README states: ``A false positive \ldots would require the T matrix symmetry to hold
+at 10 independent random coupling points by coincidence---negligibly unlikely.'' For
+genuinely asymmetric algorithms, this is correct (the zero set of a nonzero polynomial
+has measure zero). However, for algorithms that are D4-symmetric up to a small
+perturbation $\epsilon$, the violation magnitude may be $O(\epsilon)$, which could be
+below the numerical tolerance $10^{-6}$ for sufficiently small $\epsilon$. The claim
+should be qualified: it holds for algorithms whose D4 violation is not numerically small
+relative to the tolerance.
+
+%===============================================================
+\section{Fixes Applied and Remaining Issues}
+\label{sec:fixes}
+%===============================================================
+
+Following the initial audit, the three highest-impact issues were addressed in the
+codebase. This section records what was changed, verified, and what remains open.
+
+%---------------------------------------------------------------
+\subsection{Fix 1: RandomChoice weight correction (critical)}
+%---------------------------------------------------------------
+
+\textbf{Root cause.}
+\texttt{RunWithBitsAT} reads $k = \lceil\log_2 n\rceil$ bits to choose uniformly from
+an $n$-element list. Each \texttt{readBit[]} call multiplies the path weight by $1/2$,
+giving total weight $(1/2)^k$ per valid leaf. For $n$ not a power of two this is
+$1/2^k < 1/n$, so all leaf weights are underestimated by a factor $n/2^k$.
+
+\textbf{Fix.}
+After a successful index read (\texttt{idx < n}), the path weight is multiplied by
+the correction factor $2^k/n$:
+
+\begin{lstlisting}
+(* before *)
+If[idx>=n, Throw[$dbc$outOfRange,...], list[[1+idx]]]
+(* after *)
+If[idx>=n, Throw[$dbc$outOfRange,...], weight*=2^k/n; list[[1+idx]]]
+\end{lstlisting}
+
+The same correction was applied to both \texttt{RandomInteger[\{lo,hi\}]} and
+\texttt{RandomInteger[\{0,n-1\}]}, which share the same rejection-sampling logic.
+For $n$ a power of two, $2^k = n$ and the correction is 1 (no change).
+
+\textbf{Verification with purpose-built failing examples.}
+Two new example files were added to the repository to concretely demonstrate the bug
+and confirm the fix:
+
+\begin{enumerate}
+\item \textbf{\texttt{broken\_variable\_pool.wl}} (4-connectivity hop, $k=2$ bracket).
+  Two particles on a $3\times 3$ torus. The chosen particle hops to a randomly selected
+  \emph{unoccupied} 4-neighbour. When the particles are adjacent, the pool has 3
+  elements; when non-adjacent, 4 elements. Both $n=3$ and $n=4$ use $k=2$ bits.
+
+  True probabilities: $T(\text{adj}\to\text{nonadj}) = \tfrac{1}{2}\cdot\tfrac{1}{3}$,
+  $T(\text{nonadj}\to\text{adj}) = \tfrac{1}{2}\cdot\tfrac{1}{4}$.
+  With energy zero (uniform $\pi$), detailed balance requires these to be equal, which
+  they are not --- a genuine DB violation.
+
+  Before fix: BFS assigns $\tfrac{1}{2}\cdot\tfrac{1}{4}$ to both transitions
+  $\Rightarrow$ false \textbf{PASS}.
+  After fix: BFS assigns $\tfrac{1}{2}\cdot\tfrac{1}{3}$ vs $\tfrac{1}{2}\cdot\tfrac{1}{4}$
+  $\Rightarrow$ correct \textbf{FAIL}, with $T(s\to t)=1/6$ and $T(t\to s)=1/8$ printed.
+
+\item \textbf{\texttt{broken\_8way\_hop.wl}} (8-connectivity hop, $k=3$ bracket).
+  Two particles on a $4\times 4$ torus (nGrid=4 is required; on the $3\times 3$ torus
+  every pair of sites is within 8-distance 1, making the pool uniformly 7 and the
+  algorithm accidentally correct). When the particles are 8-adjacent, pool $=7$; otherwise
+  pool $=8$. Both use $k=3$ bits.
+
+  Before fix: BFS assigns $\tfrac{1}{2}\cdot\tfrac{1}{8}$ to both
+  $\Rightarrow$ false \textbf{PASS}.
+  After fix: $\tfrac{1}{2}\cdot\tfrac{1}{7}$ vs $\tfrac{1}{2}\cdot\tfrac{1}{8}$
+  $\Rightarrow$ correct \textbf{FAIL}, with $T(s\to t)=1/14$ and $T(t\to s)=1/16$.
+\end{enumerate}
+
+\textbf{Regression tests.}
+All five pre-existing examples (\texttt{single\_metropolis.wl}, \texttt{kawasaki.wl},
+\texttt{vmmc\_2d.wl}, \texttt{quadratic\_field.wl}) produce identical verdicts
+before and after the fix.  In \texttt{kawasaki.wl}, \texttt{RandomChoice} selects
+from 3 distinct-type pairs on \emph{both} the forward and reverse transition, so the
+correction factor $4/3$ appears symmetrically and cancels --- confirming that the previous
+accidental correctness was fragile rather than principled.
+
+%---------------------------------------------------------------
+\subsection{Fix 2: Ergodicity BFS starts from correct seed state}
+%---------------------------------------------------------------
+
+\textbf{Root cause.}
+The reachability BFS in \texttt{\$dbcCheckErgodicityFromLeaves} was hardcoded to start
+from state index 1 (\texttt{allStates[[1]]}), not from \texttt{\$seedState}.
+For all provided examples \texttt{\$seedState} happened to coincide with
+\texttt{allStates[[1]]} (the lexicographically first state), so the bug was latent.
+
+\textbf{Fix.}
+The function signature was extended to accept the seed state as a required parameter:
+
+\begin{lstlisting}
+(* before *)
+$dbcCheckErgodicityFromLeaves[..., allStates_, nGrid_] :=
+  Module[...,
+    reachableSet = <|1 -> True|>; queue = {1};
+
+(* after *)
+$dbcCheckErgodicityFromLeaves[..., allStates_, nGrid_, seedState_] :=
+  Module[...,
+    seedIdx = Lookup[stateToIdx, Key[seedState], 1];
+    reachableSet = <|seedIdx -> True|>; queue = {seedIdx};
+\end{lstlisting}
+
+The call site in \texttt{check.wls} was updated to pass \texttt{seedState}. A fallback
+to index 1 is retained via \texttt{Lookup[..., 1]} in case the seed is not found in the
+state index (which should not occur for well-formed input).
+
+%---------------------------------------------------------------
+\subsection{Fix 3: ebeMaxK documentation error}
+%---------------------------------------------------------------
+
+The \texttt{-ebeMaxK} help text in \texttt{check.wls} stated ``(default 12)'' while the
+actual default was 50. The help text was corrected to ``(default 50)''.
+
+%---------------------------------------------------------------
+\subsection{Remaining open issues}
+%---------------------------------------------------------------
+
+The following issues identified in the original audit are \emph{not} fixed in the
+current version:
+
+\begin{enumerate}
+\item \textbf{D4 check remains numerical.} The probabilistic Schwartz-Zippel-style
+  check for D4 rotational symmetry is sound in practice but not formally exact.
+  The recommended fix --- extending the EBE machinery to check
+  $T(s\to t) = T(R\cdot s\to R\cdot t)$ algebraically within each parameter region ---
+  has not yet been implemented. All provided examples pass the D4 check, and the
+  check has never been observed to give an incorrect verdict, but a formal algebraic
+  certification would be preferable.
+
+\item \textbf{$\tau$-BFS cantHandle for in-body Mod.} Algorithms that normalise positions
+  inside \texttt{Algorithm} (e.g., \texttt{quadratic\_field.wl}) trigger internal
+  Mathematica evaluation calls that are intercepted by the BFS override, producing a
+  \texttt{cantHandle} error rather than a genuine $\tau$-detection failure. The checker
+  falls back to the full state-space BFS and reports the correct verdict by a different
+  path. Fixing this would require either sandboxing Mathematica's internal evaluation
+  or pre-computing the normalisation symbolically.
+
+\item \textbf{Timed-out BFS returns incomplete leaves.} If a BFS exceeds the per-state
+  time limit, the leaves collected so far are returned without signalling an error.
+  Subsequent checks may produce misleading verdicts. The fix is to propagate a timeout
+  sentinel and abort the run.
+
+\item \textbf{seqBernoulli zero-weight guard missing.} If a list of weights sums to
+  zero, \texttt{seqBernoulli} will divide by zero. This is an edge case for
+  degenerate inputs but should be guarded.
+\end{enumerate}
+
+%===============================================================
+\section{Summary Table}
+\label{sec:summary}
+%===============================================================
+
+\begin{table}[h!]
+\centering
+\begin{tabular}{lllll}
+\toprule
+\textbf{Issue} & \textbf{Severity} & \textbf{Fixed?} & \textbf{Affects examples?} & \textbf{Section} \\
+\midrule
+Weight bug: non-power-of-2 RandomChoice & Critical & Yes & No (cancels) & \ref{sec:weightbug} \\
+D4 check is numerical/probabilistic & Significant & No & No & \ref{sec:d4} \\
+$\tau$-BFS errors out (not $\tau$-detection) & Moderate & No & Yes & \ref{sec:taufail:internalRNG} \\
+Ergodicity BFS starts from wrong state & Moderate & Yes & No (coincides) & \ref{issue:ergoseed} \\
+\$dbcFS treated as violation (false positive) & Moderate & No & No & \ref{sec:ebe} \\
+Timed-out BFS returns incomplete leaves & Moderate & No & No & \ref{sec:minor} \\
+seqBernoulli: no division-by-zero guard & Minor & No & No & \ref{sec:minor} \\
+NormalDistribution truncation not validated & Minor & No & No & \ref{sec:minor} \\
+ebeMaxK help text says 12 (should be 50) & Documentation & Yes & -- & \ref{sec:doc} \\
+$\tau$-failure description in README & Documentation & Yes (rewritten) & -- & \ref{sec:doc} \\
+\bottomrule
+\end{tabular}
+\caption{Summary of findings. ``Affects examples'' refers to the provided example files.
+  Three issues were fixed in the subsequent revision; see Section~\ref{sec:fixes}.}
+\end{table}
+
+%===============================================================
+\section{Conclusions}
+%===============================================================
+
+\textbf{Translational invariance check.} The $\tau$-BFS approach is mathematically
+sound. Checking from orbit representatives is provably equivalent to checking from all
+states. However, the detection mechanism can silently switch from ``$\tau$ found in
+weights'' to ``cantHandle error'' (for algorithms that trigger internal Mathematica
+random-number generation), giving correct output via an incorrect path.
+
+\textbf{EBE detailed balance check.} The EBE machinery is correct for Metropolis-type
+algorithms with rational coupling constants. The arrangement BFS correctly enumerates all
+feasible parameter regions via the hyperplane connectivity theorem. The \texttt{\$dbcIsExpZero}
+check correctly handles all expressions arising from standard Metropolis acceptance. The
+check is \emph{exact} (not probabilistic) for $k \leq \texttt{ebeMaxK}$.
+
+\textbf{Critical weight bug.} The transition weights assigned by the BFS for
+\texttt{RandomChoice[list]} with non-power-of-2 $n$ are systematically off by a factor
+$n/2^k$. For the provided examples this factor cancels between forward and reverse
+transitions, leaving the DB verdict correct. For algorithms with varying proposal-pool
+sizes (asymmetric Metropolis-Hastings), this bug can produce both false positives and
+false negatives. It must be fixed before the checker can be applied with confidence to
+general Metropolis-Hastings algorithms.
+
+\textbf{D4 check.} The numerical D4 check cannot be replaced by a $\tau$-style algebraic
+trick due to the discrete, non-additive nature of D4. However, an exact certification is
+achievable by extending the existing EBE machinery: after enumerating all parameter
+regions, check $T(s\to t) = T(R\cdot s\to R\cdot t)$ as exact rational equalities within
+each region. This would make the D4 check as rigorous as the DB check itself, at
+comparable computational cost.
+
+\end{document}

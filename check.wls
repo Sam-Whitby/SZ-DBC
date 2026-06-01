@@ -11,7 +11,7 @@
      -mode FullSimplify          Use FullSimplify instead of EBE
      -mode Numerical             Numerical MCMC check only
      -szRepeats N      Random evaluation points for SZ fallback (default 30)
-     -ebeMaxK N        Max branch conditions for EBE; falls back to SZ above (default 12)
+     -ebeMaxK N        Max branch conditions for EBE; falls back to SZ above (default 50)
      -maxDepth N       Maximum BFS bit depth (default 22)
      -timeLimit T      Per-state time limit in seconds (default 120)
      -verbose          Print extra BFS progress info
@@ -335,7 +335,7 @@ If[wantD4 && tauResult["tauFree"] === True,
 
 printSection["Step 7: Ergodicity (reachability check)"];
 t7 = AbsoluteTime[];
-ergoResult = $dbcCheckErgodicityFromLeaves[repLeaves, repToOrbitMap, allStates, nGrid];
+ergoResult = $dbcCheckErgodicityFromLeaves[repLeaves, repToOrbitMap, allStates, nGrid, seedState];
 Print["  Reachable : ", ergoResult["reached"], "/", ergoResult["total"],
       "  (", Round[AbsoluteTime[]-t7, 0.01], "s)"];
 If[ergoResult["ergodic"],

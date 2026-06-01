@@ -292,12 +292,12 @@ RunWithBitsAT[alg_, state_, bits_List] :=
               Module[{lo=args[[1,1]], hi=args[[1,2]], n, k, val},
                 n=hi-lo+1; If[n==1,lo,
                   k=IntegerLength[n-1,2]; val=$dbc$readBitsAsInt[k,readBit];
-                  If[val>=n, Throw[$dbc$outOfRange,$dbc$tag], lo+val]]],
+                  If[val>=n, Throw[$dbc$outOfRange,$dbc$tag], weight*=2^k/n; lo+val]]],
             MatchQ[args,{_Integer?NonNegative}],
               Module[{n=args[[1]]+1, k, val},
                 If[n==1,0,
                   k=IntegerLength[n-1,2]; val=$dbc$readBitsAsInt[k,readBit];
-                  If[val>=n, Throw[$dbc$outOfRange,$dbc$tag], val]]],
+                  If[val>=n, Throw[$dbc$outOfRange,$dbc$tag], weight*=2^k/n; val]]],
             True, Throw[$dbc$cantHandle["RandomInteger["<>ToString[args]<>"]"],$dbc$tag]]]],
         RandomChoice = Function[Module[{args = {##}},
           Which[
@@ -307,7 +307,7 @@ RunWithBitsAT[alg_, state_, bits_List] :=
                 Which[n==0, Throw[$dbc$cantHandle["RandomChoice: empty"],$dbc$tag],
                       n==1, list[[1]],
                       True, k=IntegerLength[n-1,2]; idx=$dbc$readBitsAsInt[k,readBit];
-                            If[idx>=n,Throw[$dbc$outOfRange,$dbc$tag],list[[1+idx]]]]],
+                            If[idx>=n,Throw[$dbc$outOfRange,$dbc$tag],weight*=2^k/n; list[[1+idx]]]]],
             Length[args]==1 && MatchQ[args[[1]],Rule[_List,_List]],
               Module[{ws=args[[1,1]], elems=args[[1,2]]},
                 If[Length[ws]=!=Length[elems],
@@ -467,9 +467,9 @@ CheckErgodicity[allStates_List, nGrid_Integer] :=
    This tests the algorithm's actual connectivity, not just the
    state count.  Requires orbit BFS to have been completed. *)
 $dbcCheckErgodicityFromLeaves[repLeaves_Association, repToOrbitMap_Association,
-                               allStates_List, nGrid_Integer] :=
+                               allStates_List, nGrid_Integer, seedState_List] :=
   Module[{nStates, stateToIdx, adjFwd, repList, repKey, orbitMap,
-          srcIdx, dstIdx, reachableSet, queue, curIdx},
+          srcIdx, dstIdx, reachableSet, queue, curIdx, seedIdx},
     nStates    = Length[allStates];
     stateToIdx = AssociationThread[allStates -> Range[nStates]];
     repList    = Keys[repLeaves];
@@ -491,9 +491,10 @@ $dbcCheckErgodicityFromLeaves[repLeaves_Association, repToOrbitMap_Association,
         orbitMap],
       {ri, Length[repList]}];
 
-    (* BFS from state index 1 (first enumerated state = seed) *)
-    reachableSet = <|1 -> True|>;
-    queue = {1};
+    (* BFS from the actual seed state *)
+    seedIdx = Lookup[stateToIdx, Key[seedState], 1];
+    reachableSet = <|seedIdx -> True|>;
+    queue = {seedIdx};
     While[queue =!= {},
       curIdx = First[queue]; queue = Rest[queue];
       Scan[Function[n,
