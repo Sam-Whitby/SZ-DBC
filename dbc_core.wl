@@ -455,14 +455,21 @@ $dbcBuildStateLeaves[state_, alg_, maxDepth_Integer, tlim_,
    are τ-free iff the algorithm is translation-invariant.
    Checking from orbit reps is ~63× faster than the full state-space
    BFS while covering all distinct states (given G-symmetry).
+
+   When translation invariance passes, the τ-leaves are also returned
+   as concrete BFS leaves (τr→0, τc→0 substituted) in "repLeaves".
+   Setting τ=0 in a τ-BFS leaf gives exactly what a regular BFS from
+   the same rep would produce, so the caller can skip the separate
+   regular BFS step entirely.  "repLeaves" is None when tauFree≠True.
    ================================================================ *)
 
 $dbcCheckTranslational[states_List, alg_, nGrid_Integer,
                         maxDepth_Integer, tlim_] :=
-  Module[{τNorm, tauFree = True, violations = {}},
+  Module[{τNorm, tauFree = True, violations = {}, repLeavesOut = <||>},
     τNorm = $dbcNormTauState[#, nGrid] &;
     Do[
-      With[{τLeaves = $dbcBuildStateLeaves[
+      With[{s = states[[si]],
+            τLeaves = $dbcBuildStateLeaves[
               $dbcAddTau[states[[si]]], alg, maxDepth, tlim, nGrid, τNorm]},
         If[MatchQ[τLeaves, $dbc$cantHandle[_]],
           Return[<|"tauFree"->$Failed, "error"->τLeaves[[1]]|>, Module]];
@@ -470,9 +477,14 @@ $dbcCheckTranslational[states_List, alg_, nGrid_Integer,
           If[!FreeQ[leaf[[3]], τr] || !FreeQ[leaf[[3]], τc],
             tauFree = False;
             AppendTo[violations, leaf[[3]]]]],
+          τLeaves];
+        repLeavesOut[s] = Map[
+          {#[[1]], #[[2]] /. {τr -> 0, τc -> 0}, #[[3]]} &,
           τLeaves]],
       {si, Length[states]}];
-    <|"tauFree" -> tauFree, "violations" -> Take[violations, UpTo[5]]|>]
+    <|"tauFree"   -> tauFree,
+      "violations" -> Take[violations, UpTo[5]],
+      "repLeaves"  -> If[tauFree, repLeavesOut, None]|>]
 
 
 

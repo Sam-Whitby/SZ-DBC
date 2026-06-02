@@ -224,6 +224,11 @@ If[wantTrans && mode =!= "Numerical",
 
 (* ================================================================
    STEP 5 — BFS from orbit representatives
+   ================================================================
+   When τ-BFS passed (Step 4), its leaves are reused directly
+   (τr→0, τc→0 already substituted in $dbcCheckTranslational).
+   This avoids a second identical BFS pass — ~13s saved for vmmc_2d.
+   Falls back to a regular BFS when τ-BFS was skipped or failed.
    ================================================================ *)
 
 printSection["Step 5: BFS from orbit reps"];
@@ -231,20 +236,27 @@ t5 = AbsoluteTime[];
 normFn = $dbcNormState[#, nGrid]&;
 repLeaves = <||>;
 err = None;
-Do[
-  s      = reps[[ri]];
-  leaves = $dbcBuildStateLeaves[s, Algorithm, maxDepth, timeLimit, nGrid, normFn];
-  If[MatchQ[leaves, $dbc$cantHandle[_]],
-    err = leaves[[1]]; Break[]];
-  repLeaves[s] = leaves;
-  If[verbose, Print["  rep ", ri, "/", Length[reps], " done"]],
-  {ri, Length[reps]}];
 
-If[err =!= None,
-  Print["  ERROR in BFS: ", err]; Exit[1]];
+If[TrueQ[tauResult["tauFree"]] && AssociationQ[tauResult["repLeaves"]],
+  repLeaves = tauResult["repLeaves"];
+  Print["  BFS done: ", Length[reps], " reps (reused from τ-BFS)  (",
+        Round[AbsoluteTime[]-t5, 0.01], "s)"],
 
-Print["  BFS done: ", Length[reps], " reps  (",
-      Round[AbsoluteTime[]-t5, 0.01], "s)"];
+  Do[
+    s      = reps[[ri]];
+    leaves = $dbcBuildStateLeaves[s, Algorithm, maxDepth, timeLimit, nGrid, normFn];
+    If[MatchQ[leaves, $dbc$cantHandle[_]],
+      err = leaves[[1]]; Break[]];
+    repLeaves[s] = leaves;
+    If[verbose, Print["  rep ", ri, "/", Length[reps], " done"]],
+    {ri, Length[reps]}];
+
+  If[err =!= None,
+    Print["  ERROR in BFS: ", err]; Exit[1]];
+
+  Print["  BFS done: ", Length[reps], " reps  (",
+        Round[AbsoluteTime[]-t5, 0.01], "s)"]];
+
 
 
 (* ================================================================

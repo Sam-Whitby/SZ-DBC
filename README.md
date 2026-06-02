@@ -55,15 +55,13 @@ All `N! / (n₁! n₂! ...)` states for the given particle type multiset are enu
 
 Translation-only orbits are computed first. D4 rotational symmetry is verified algebraically in a later step before being used to reduce the orbit set further.
 
-### Step 4 — Translational invariance (algebraic τ-BFS)
+### Step 4 — τ-BFS: translational invariance check and leaf capture
 
-Particle positions are augmented with a symbolic offset `{τr, τc}` and the BFS is re-run on these τ-augmented states. If the algorithm uses only **pairwise differences** for all spatial decisions, τ cancels algebraically from every leaf weight, and the check passes. This is verified symbolically — no numerical sampling.
+Particle positions are augmented with a symbolic offset `{τr, τc}` and the BFS engine runs on these τ-augmented states. If the algorithm uses only **pairwise differences** for all spatial decisions, τ cancels algebraically from every leaf weight and the check passes. This is verified symbolically — no numerical sampling.
 
-If the τ-BFS encounters a `cantHandle` condition (e.g., `Mod[position, n]` on symbolic values), it prints an informative message and falls back to the non-translation path.
+When translation invariance passes, the τ-leaves are immediately converted to concrete BFS leaves by substituting `τr→0, τc→0`. Setting τ=0 in a τ-BFS leaf gives exactly the same `{bits, nextState, weight}` triple that a separate BFS on the non-augmented representative would produce (since τ cancels from all weights and the position normalisation collapses to the standard form at τ=0). The converted leaves are used directly for all downstream steps (ergodicity, DB check), so no second BFS pass is needed.
 
-### Step 5 — BFS from orbit representatives
-
-The BFS engine runs on each orbit representative. Leaves accumulate as `{bits, nextState, weight}` triples.
+If the τ-BFS encounters a `cantHandle` condition (e.g., `Mod[position, n]` on symbolic values), it falls back to a standard BFS on the original (non-τ-augmented) states.
 
 ### Step 5b — Rotational invariance (D4, algebraic via EBE) — optional
 
@@ -81,7 +79,7 @@ A graph BFS is run from `$seedState` over the transition graph derived from the 
 
 The leaf weights are symbolic expressions in the coupling parameters. The Piecewise branch conditions define a **hyperplane arrangement** in parameter space. EBE enumerates all feasible chambers via a BFS starting from a random interior point. Within each chamber the Piecewise conditions resolve to constants, and the DB equation reduces to a check of the form `sum(rational × exp(-β × rational)) = 0`, verified exactly by grouping exponent classes and checking rational coefficients.
 
-If `k > ebeMaxK` (default 50), EBE falls back to the probabilistic Schwartz-Zippel check.
+If `k > ebeMaxK` (default 10000, effectively unlimited), EBE falls back to the probabilistic Schwartz-Zippel check.
 
 ---
 
@@ -164,9 +162,9 @@ wolframscript -file check.wls <algorithm.wl> [options]
 
 | File | Expected result | Time (3×3, 3 particles) |
 |---|---|---|
-| `single_metropolis.wl` | τ PASS, DB PASS | ~45s |
+| `single_metropolis.wl` | τ PASS, DB PASS | ~38s |
 | `kawasaki.wl` | τ PASS, DB PASS, Ergodicity FAIL (by design) | ~4s |
-| `vmmc_2d.wl` | τ PASS, DB PASS | ~215s |
+| `vmmc_2d.wl` | τ PASS, DB PASS | ~193s |
 | `quadratic_field.wl` | τ FAIL (absolute-position energy), DB PASS | ~5s |
 | `broken_variable_pool.wl` | DB FAIL — asymmetric pool size (3 or 4) | <5s |
 | `broken_8way_hop.wl` | DB FAIL — asymmetric pool size (7 or 8) | <5s |
@@ -174,7 +172,7 @@ wolframscript -file check.wls <algorithm.wl> [options]
 | `broken_metropolis_halfbeta.wl` | DB FAIL — accept probability uses β/2 instead of β | <5s |
 | `broken_field_wrong_accept.wl` | DB FAIL — accept uses pair energy only, ignores field | <5s |
 
-The `vmmc_2d.wl` runtime of ~215s is inherent to the algorithm: VMMC's cluster-building
+The `vmmc_2d.wl` runtime of ~193s is dominated by EBE Phase 3: VMMC's cluster-building
 logic generates k=12 nearly independent Piecewise conditions, producing 512 feasible
 coupling-constant chambers. Each chamber requires checking 5,688 communicating state
 pairs. This scales as O(chambers × pairs) and is the fundamental cost of an exact
