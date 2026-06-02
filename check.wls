@@ -45,7 +45,7 @@ mode       = parseOpt["-mode", "Symbolic"];
 szRepeats  = ToExpression[parseOpt["-szRepeats", "30"]];
 maxDepth   = ToExpression[parseOpt["-maxDepth",  "22"]];
 timeLimit  = ToExpression[parseOpt["-timeLimit", "120"]];
-ebeMaxK    = ToExpression[parseOpt["-ebeMaxK",   "50"]];
+ebeMaxK    = ToExpression[parseOpt["-ebeMaxK",   "10000"]];
 verbose    = parseBool["-verbose"];
 
 

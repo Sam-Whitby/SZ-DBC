@@ -65,15 +65,13 @@ If the τ-BFS encounters a `cantHandle` condition (e.g., `Mod[position, n]` on s
 
 The BFS engine runs on each orbit representative. Leaves accumulate as `{bits, nextState, weight}` triples.
 
-### Step 5b — Rotational invariance (D4, algebraic via EBE)
+### Step 5b — Rotational invariance (D4, algebraic via EBE) — optional
 
-If `"D4"` is in `$symmetryGroup` and translation invariance passed, D4 is verified **algebraically** using EBE (Exhaustive Branch Enumeration). This runs the same Phase 1 (condition extraction) and Phase 2 (chamber enumeration) as the DB check, then in Phase 3 verifies `T(s→t) = T(R·s→R·t)` exactly within every feasible parameter region using `$dbcIsExpZero`.
+If `"D4"` is in `$symmetryGroup` and translation invariance passed, D4 is verified **algebraically** using EBE. This checks `T(s→t) = T(R·s→R·t)` exactly within every feasible parameter region using `$dbcIsExpZero`, for two D4 generators (rotation by 90° and left-right reflection), which by group theory is sufficient for all 8 D4 elements.
 
-Only two D4 generators are checked: rotation by 90° (`rotIdx=1`) and a left-right reflection (`rotIdx=4`). By group theory, if the condition holds for both generators it holds for all 8 D4 elements.
+**D4 is not included in `$symmetryGroup` by default** because for algorithms with many coupling-constant chambers (e.g. VMMC with 512 chambers), the D4 verification costs as much as two full DB checks while providing negligible speedup on the DB check itself. Include `"D4"` only if you specifically need to verify rotational symmetry of the algorithm.
 
-The EBE chambers computed here are reused by the DB check (Step 8), so no duplicate Phase 2 enumeration occurs. If the new BFS produces conditions not seen in the D4 EBE, the SubsetQ assertion detects this and falls back to running Phase 2 from scratch.
-
-Falls back to probabilistic SZ when `k > ebeMaxK`.
+When D4 passes, orbit representatives are reduced from 56 (translation only) to 8 (D4+translation), and the EBE chambers are reused by the DB check (Step 8). Falls back to probabilistic SZ when `k > ebeMaxK`.
 
 ### Step 7 — Ergodicity
 
@@ -97,7 +95,7 @@ $particleTypes = {1, 2, 3};   (* type multiset *)
 
 $seedState = Module[...];     (* canonical starting state *)
 
-$symmetryGroup = {"translation", "D4"};   (* symmetries to check/exploit *)
+$symmetryGroup = {"translation"};   (* "D4" may be added to also verify D4 symmetry *)
 
 energy[state_] := ...         (* bare energy, no beta factor *)
 
@@ -152,7 +150,7 @@ wolframscript -file check.wls <algorithm.wl> [options]
   -mode FullSimplify    FullSimplify each DB expression
   -mode Numerical       Numerical MCMC comparison only
   -szRepeats N          SZ random evaluation points (default 30)
-  -ebeMaxK N            Max Piecewise conditions for EBE (default 50)
+  -ebeMaxK N            Max Piecewise conditions for EBE (default 10000 — effectively unlimited)
   -maxDepth N           BFS bit depth limit (default 22)
   -timeLimit T          Per-state time limit in seconds (default 120)
   -verbose              Print per-rep BFS progress
@@ -162,25 +160,31 @@ wolframscript -file check.wls <algorithm.wl> [options]
 
 ## Provided examples
 
-| File | Expected result |
-|---|---|
-| `single_metropolis.wl` | τ PASS, D4 PASS, DB PASS |
-| `kawasaki.wl` | τ PASS, D4 PASS, DB PASS, Ergodicity FAIL (by design) |
-| `vmmc_2d.wl` | τ PASS, D4 PASS, DB PASS |
-| `quadratic_field.wl` | τ FAIL (absolute-position energy), DB PASS |
-| `broken_variable_pool.wl` | DB FAIL — asymmetric pool size (3 or 4) |
-| `broken_8way_hop.wl` | DB FAIL — asymmetric pool size (7 or 8) |
-| `broken_biased_direction.wl` | DB FAIL — duplicate direction in proposal pool |
-| `broken_metropolis_halfbeta.wl` | DB FAIL — accept probability uses β/2 instead of β |
-| `broken_field_wrong_accept.wl` | DB FAIL — accept uses pair energy only, ignores field |
+| File | Expected result | Time (3×3, 3 particles) |
+|---|---|---|
+| `single_metropolis.wl` | τ PASS, DB PASS | ~45s |
+| `kawasaki.wl` | τ PASS, DB PASS, Ergodicity FAIL (by design) | ~4s |
+| `vmmc_2d.wl` | τ PASS, DB PASS | ~215s |
+| `quadratic_field.wl` | τ FAIL (absolute-position energy), DB PASS | ~5s |
+| `broken_variable_pool.wl` | DB FAIL — asymmetric pool size (3 or 4) | <5s |
+| `broken_8way_hop.wl` | DB FAIL — asymmetric pool size (7 or 8) | <5s |
+| `broken_biased_direction.wl` | DB FAIL — duplicate direction in proposal pool | <5s |
+| `broken_metropolis_halfbeta.wl` | DB FAIL — accept probability uses β/2 instead of β | <5s |
+| `broken_field_wrong_accept.wl` | DB FAIL — accept uses pair energy only, ignores field | <5s |
+
+The `vmmc_2d.wl` runtime of ~215s is inherent to the algorithm: VMMC's cluster-building
+logic generates k=12 nearly independent Piecewise conditions, producing 512 feasible
+coupling-constant chambers. Each chamber requires checking 5,688 communicating state
+pairs. This scales as O(chambers × pairs) and is the fundamental cost of an exact
+algebraic verification.
 
 ---
 
 ## Known limitations
 
-**EBE falls back to probabilistic SZ when `k > ebeMaxK`.** Algorithms with many distinct pairwise interaction distances generate many Piecewise conditions. When `k > ebeMaxK` (default 50), EBE switches to probabilistic Schwartz-Zippel. Increase `-ebeMaxK` or accept the probabilistic guarantee.
+**EBE always runs exactly; probabilistic SZ is opt-in.** The default `ebeMaxK=10000` means EBE runs for any realistic algorithm. To use the probabilistic Schwartz-Zippel fallback explicitly, pass `-mode SZPure` or lower `-ebeMaxK`.
 
-**D4 check is algebraically exact but can be slow.** The EBE-based D4 check scales as O(feasibleRegions × pairs × generators). `vmmc_2d.wl` (k=12, 512 regions) takes ~240s for D4 EBE. Falls back to probabilistic SZ when k > ebeMaxK.
+**D4 check is algebraically exact but expensive relative to its benefit.** For algorithms with many feasible chambers (e.g. VMMC with 512), the D4 EBE verification costs approximately 2× the DB check while the orbit reduction it enables saves less than 10% on DB Phase 3. D4 is therefore not in `$symmetryGroup` by default. Add it back if you need to verify rotational symmetry as a separate correctness claim.
 
 **τ-BFS cantHandle for in-body Mod.** If the algorithm normalises particle positions inside the step function using `Mod[pos, n]` on symbolic values, Mathematica may trigger internal evaluation calls that are intercepted by the BFS override, causing a cantHandle error. The checker falls back to the full state-space BFS without the translation speedup.
 

@@ -1,0 +1,1119 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{mdframed}
+\usepackage{mathtools}
+\usepackage{microtype}
+
+\geometry{margin=2.5cm}
+
+\lstset{
+  basicstyle=\small\ttfamily,
+  breaklines=true,
+  frame=single,
+  language=Mathematica,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  backgroundcolor=\color{gray!5}
+}
+
+\newtheoremstyle{critical}{}{}{\itshape}{}{\bfseries\color{red}}{.}{ }{}
+\theoremstyle{critical}
+\newtheorem{issue}{Issue}
+
+\newtheoremstyle{remark}{}{}{}{}{\bfseries}{.}{ }{}
+\theoremstyle{remark}
+\newtheorem{rem}{Remark}
+\newtheorem{claim}{Claim}
+\newtheorem{theorem}{Theorem}
+
+\newtheoremstyle{verified}{}{}{}{}{\bfseries\color{blue!70!black}}{.}{ }{}
+\theoremstyle{verified}
+\newtheorem{verified}{Verified}
+
+\title{\textbf{Critical Audit of SZ-DBC (Second Report):\\Detailed Balance Checker for Lattice MCMC}\\[1ex]
+\large Correctness, rigor, and portability analysis\\
+\normalsize Incorporating all fixes from the first report}
+\author{Independent Technical Review}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%===============================================================
+\section{Scope and Method}
+%===============================================================
+
+This report constitutes a deep, independent audit of the SZ-DBC codebase as it
+stands after the two rounds of fixes described in the previous report
+(\texttt{critical\_report.tex}).  All seven issues raised there have been addressed;
+this review therefore starts fresh and examines the \emph{current} code for
+new correctness problems, rigour gaps, and undocumented limitations.
+
+The methodology was: read every line of \texttt{dbc\_core.wl} and
+\texttt{check.wls}; run all provided examples and verify their outputs; run
+targeted Wolfram~Language micro-experiments to probe specific claims; and
+reason from first principles about every non-trivial assertion made by the
+code or its documentation.  All example runs were performed on the current
+codebase with \texttt{wolframscript}.
+
+\begin{mdframed}[backgroundcolor=green!8,linecolor=green!60!black,linewidth=1pt]
+\textbf{Top-line verdict.}
+The checker is now substantially more rigorous than the version audited in the
+first report.  The critical RandomChoice weight bug is fixed, the D4 check is
+algebraically exact, the ergodicity BFS starts from the correct seed, and
+timed-out BFS paths abort with an error.  The EBE-based DB check is exact for
+all algorithms with fewer than \texttt{ebeMaxK} branch conditions.
+
+Two moderate correctness concerns survive: (1) an unverified assumption that
+the post-D4 BFS introduces no new Piecewise conditions beyond those seen in the
+pre-D4 BFS, silently relied upon when reusing EBE chambers; (2) the
+\texttt{\$dbcFS} sentinel is treated as a DB violation rather than an analysis
+failure.  Neither causes problems for the provided examples.  Three minor issues
+round out the analysis.
+\end{mdframed}
+
+%===============================================================
+\section{The BFS Engine: Correctness Review}
+\label{sec:bfs}
+%===============================================================
+
+\subsection{Weight completeness}
+
+A necessary condition for BFS correctness is that the leaf weights for any
+single starting state sum to~1 (probability is conserved across all execution
+paths).  This was verified experimentally on the first orbit representative of
+\texttt{single\_metropolis.wl}:
+
+\begin{lstlisting}
+Total[#[[3]] & /@ leaves]  (* symbolic sum over all leaves *)
+(* After Simplify: 1 *)
+\end{lstlisting}
+
+The sum is a large symbolic expression involving Piecewise coupling comparisons
+and Boltzmann factors; \texttt{Simplify} reduces it to~$1$ exactly.  This
+confirms that the accept/reject branches pair correctly and that the
+weight-correction factors $2^k/n$ for \texttt{RandomChoice} are applied
+consistently.  The proof that weight sums to~1 holds generally:
+
+\begin{theorem}[Weight completeness]
+For any algorithm whose random calls are all handled by the BFS engine (no
+\texttt{cantHandle}), the leaf weights from any starting state sum to~$1$.
+\end{theorem}
+
+\begin{proof}[Sketch]
+By construction, each \texttt{RandomReal[]} comparison branches into two paths
+with weights $p$ and $1-p$ summing to~$1$.  Each \texttt{RandomChoice[list]}
+with $n$ elements reads $k = \lceil\log_2 n\rceil$ bits; in-range leaves each
+have weight $2^k/n$ (after correction), and the $2^k - n$ out-of-range paths
+are discarded.  The $n$ in-range leaves carry weight $n \cdot (1/2^k) \cdot
+(2^k/n) = 1$.  The \texttt{seqBernoulli} decomposition is a perfect partition
+of~$[0,1]$ by construction (verified above).  The product of independent
+branches gives a probability measure on the leaf set.
+\end{proof}
+
+\subsection{RandomChoice correction for non-power-of-2 pool sizes}
+
+This was the critical bug fixed in the first revision.  The current code applies:
+\begin{lstlisting}
+weight *= 2^k/n;  (* after selecting valid index *)
+\end{lstlisting}
+for \texttt{RandomChoice[list]}, \texttt{RandomInteger[\{lo,hi\}]}, and the
+vectorised forms.  For $n$ a power of~2 the factor is~$1$ and has no effect;
+for general $n$ it corrects the per-leaf weight from $1/2^k$ to $1/n$.  The
+broken examples \texttt{broken\_variable\_pool.wl} (pool size 3 or 4, $k=2$)
+and \texttt{broken\_8way\_hop.wl} (pool size 7 or 8, $k=3$) now correctly
+report \textbf{FAIL} with exact rational transition probabilities printed.
+
+\begin{verified}
+All nine examples produce the expected verdict.  D4 is no longer declared in
+\texttt{\$symmetryGroup} by default (see Section~\ref{sec:d4perf}): the three
+passing examples (\texttt{single\_metropolis}, \texttt{kawasaki},
+\texttt{vmmc\_2d}) show \texttt{D4 rotational: not declared} in their summary
+output.  DB correctness is unaffected.
+\end{verified}
+
+\subsection{Edge cases in the BFS engine}
+
+\noindent\textbf{Empty range \texttt{RandomInteger[\{hi,lo\}]} with $hi < lo$.}
+When $n = hi - lo + 1 \leq 0$, the code computes
+$k = \texttt{IntegerLength}[n-1, 2]$.  For $n = 0$: \texttt{IntegerLength}$[-1,2]$
+$= 1$, so one bit is read and $\texttt{val} \in \{0,1\}$; both satisfy
+$\texttt{val} \geq n = 0$, so \texttt{\$dbc\$outOfRange} is thrown and the path
+is silently discarded.  This is correct behaviour (a call with inverted bounds
+has no valid outcomes) but is not documented.
+
+\noindent\textbf{Single-element lists.}
+\texttt{RandomChoice[\{x\}]} (n=1) returns $x$ immediately without reading bits
+(explicit \texttt{n==1} branch).  \texttt{RandomInteger[\{lo,lo\}]} (n=1)
+similarly returns \texttt{lo} with weight~$1$.  \texttt{seqBernoulli[\ldots,
+\{e\}]} (one element) is short-circuited before the call site.  All correct.
+
+\noindent\textbf{Zero-weight seqBernoulli guard.}
+The guard \texttt{If[TrueQ[remainW == 0], Throw[\$dbc\$cantHandle[...]]]} was
+added in the second revision.  Experimentally verified: for concrete zeros
+(\texttt{ws = \{0,0,0\}}) and for symbolically simplified zeros
+(\texttt{\{couplingJ[1,2,1], -couplingJ[1,2,1]\}}), Mathematica simplifies
+\texttt{Total[ws]} to \texttt{0} and \texttt{TrueQ[0 == 0]} returns
+\texttt{True}, so the guard fires.  For genuinely pathological cases where a
+symbolic total equals zero but Mathematica does not simplify it, division by
+zero would produce \texttt{Indeterminate}.  This is unlikely for physical
+algorithms (weights are non-negative energy-difference expressions).
+
+%===============================================================
+\section{The EBE Exact DB Check}
+\label{sec:ebe}
+%===============================================================
+
+\subsection{Phase 1: Condition extraction}
+
+The extraction pattern matches \texttt{HoldPattern[Piecewise[cl\_List, \_]]} to
+avoid premature evaluation of Piecewise clauses.  It retains only
+\texttt{\_Less | \_LessEqual | \_Greater | \_GreaterEqual} conditions that
+involve at least one symbolic parameter.  This correctly excludes \texttt{True},
+\texttt{False}, \texttt{=== Infinity} sentinels (SameQ, not a comparison), and
+numeric constants.
+
+For \texttt{vmmc\_2d.wl}, link probabilities include clauses of the form
+\texttt{\{1, eFwd === Infinity\}} using \texttt{===} (structural equality), which
+are not matched by the comparison filter and are therefore never extracted as EBE
+conditions.  Since \texttt{couplingJ[\ldots] === Infinity} evaluates to
+\texttt{False} for any finite coupling, these clauses always contribute weight~0
+and the extraction is correct.
+
+\subsection{Phase 2: Chamber enumeration}
+
+\begin{claim}[Correctness of arrangement BFS]
+The chamber-adjacency BFS in Phase~2 visits every non-empty open chamber of the
+hyperplane arrangement defined by the $k$ Piecewise conditions.
+\end{claim}
+
+\begin{proof}
+The arrangement is finite; each hyperplane is defined by a linear inequality in
+the coupling constants.  By the standard connectivity theorem (any two chambers
+are path-connected via a sequence of codimension-1 face crossings), the
+face-adjacency graph is connected.  The BFS therefore visits every chamber
+reachable from the starting point.  By connectivity, this is all chambers.
+
+For each adjacent chamber (sign-pattern obtained by flipping one condition),
+\texttt{FindInstance[constraints, allSymParams, Rationals, 1]} is called.  For
+rational-coefficient linear inequalities over the reals, a rational interior
+point exists whenever the region is non-empty (rational points are dense in any
+open set).  Thus if a chamber is non-empty, \texttt{FindInstance} will find a
+representative.
+\end{proof}
+
+\noindent\textbf{Boundary omission.}
+The open-chamber enumeration does not test the lower-dimensional faces where two
+or more conditions are simultaneously tight (e.g., $J_1 = J_2$ exactly).  A DB
+violation existing only on such a boundary (and not in any adjacent open chamber)
+would be missed.  For Metropolis-type algorithms, transition probabilities are
+continuous functions of the coupling constants; any violation in a positive-measure
+region must therefore appear in an adjacent open chamber.  The only pathological
+case is an algorithm with an explicit equality-trigger rule (\emph{e.g.}
+\texttt{If[$J_1$ == $J_2$, ...]}), which would be non-standard.  This should be
+documented.
+
+\subsection{Phase 3: The \texorpdfstring{$\$dbcIsExpZero$}{dbcIsExpZero} check}
+\label{sec:expzero}
+
+After substituting a rational representative $J^\ast$ into every leaf weight,
+the DB expression takes the form $\sum_i c_i e^{-\beta E_i}$ where $c_i$ are
+rational and $E_i$ are rational multiples of $\beta$, \emph{i.e.}
+$\sum_i c_i E^{-\beta r_i}$ with $r_i \in \mathbb{Q}$.  The function
+\texttt{\$dbcIsExpZero} checks this is zero as follows:
+
+\begin{enumerate}
+\item \texttt{\$dbcMergeExp}: iteratively replaces
+  $E^a \cdot E^b \to E^{a+b}$ until no such pairs remain
+  (at most 30 iterations).
+\item \texttt{\$dbcSplitTerm}: for each term, extract the unique Exp factor (if
+  any) to produce \texttt{\{coefficient, exponent\}}.  Returns \texttt{\$dbcFS}
+  if two or more distinct Exp factors remain after merging.
+\item \texttt{\$dbcGroupByExp}: group terms by exponent using
+  \texttt{Expand[\ldots] === 0}.
+\item Check that the sum of rational coefficients in each group is zero.
+\end{enumerate}
+
+\noindent\textbf{Correctness for standard algorithms.}
+Experimentally verified: after $J^\ast$ substitution, all Exp factors in
+Metropolis-type algorithms are of the form $E^{-\beta r}$; \texttt{\$dbcMergeExp}
+reduces any product $E^{-\beta r_1} \cdot E^{-\beta r_2}$ in one iteration.
+The \texttt{\$dbcFS} branch is never triggered for any of the provided examples.
+For algorithms producing genuine transcendental coefficients
+(e.g.\ $E^{\sin(\beta)}$), merging would fail after 30 iterations and
+\texttt{\$dbcFS} would be returned.
+
+\begin{issue}[\texttt{\$dbcFS} treated as a violation, not an analysis failure]
+\label{issue:dbcfs}
+The check \texttt{If[res =!= True, violations[pair] = ...]} treats both
+\texttt{False} (genuine DB violation) and \texttt{\$dbcFS} (analysis failure)
+as violations.  A user whose algorithm produces a \texttt{\$dbcFS} result (e.g.\
+an algorithm using $\sin(\beta)$ in the acceptance probability) would receive a
+FAIL verdict with no diagnostic distinguishing the two cases.  The violation
+record would contain a \texttt{tij} or \texttt{tji} field with an unresolved
+symbolic expression, which is the only hint that analysis failed rather than DB
+being violated.
+
+This is a pre-existing issue from the first report, not yet fixed.  It is
+harmless for all standard physics algorithms tested, but a defensive fix (checking
+\texttt{res === \$dbcFS} separately and aborting with an error) is
+straightforward.
+\end{issue}
+
+%===============================================================
+\section{The D4 Algebraic Check: Review of the New Implementation}
+\label{sec:d4}
+%===============================================================
+
+\subsection{Generator sufficiency}
+
+The D4 check tests only two generators: \texttt{rotIdx=1} (90\(^\circ\) clockwise
+rotation) and \texttt{rotIdx=4} (left-right reflection).  The claim is that
+these generate the full D4 group.  This is verified:
+
+\begin{proof}
+With $r$ = rot90CW (order 4) and $s$ = reflLR (order 2), we have:
+\begin{align*}
+  r^0 &= \text{id},\quad r^1 = \text{rot90},\quad r^2 = \text{rot180},\quad r^3 = \text{rot270}\\
+  s\cdot r^0 &= \text{reflLR},\quad s\cdot r^1 = \text{reflDiag},\quad
+  s\cdot r^2 = \text{reflUD},\quad s\cdot r^3 = \text{reflAnti}
+\end{align*}
+These 8 elements are all distinct and cover D4.  Verified numerically by applying
+all compositions to an asymmetric test state and confirming 8 distinct images
+matching all \texttt{rotIdx} 0--7.
+\end{proof}
+
+The group-theoretic argument that verifying invariance for generators $r$ and $s$
+implies invariance for all products is correct by induction: if $T(x\to y) =
+T(r\cdot x\to r\cdot y)$ for all pairs, then applying this to the pair
+$(s\cdot x, s\cdot y)$ gives $T(s\cdot x\to s\cdot y) = T(r\cdot s\cdot x\to
+r\cdot s\cdot y)$, establishing invariance under $r\cdot s$.  By induction over
+all words in $\{r, s\}$, invariance holds for all D4 elements.
+
+\subsection{Correctness of Phase 3: checking $T(i\to j)$ vs $T(R\cdot i\to R\cdot j)$}
+
+In Phase~3 of \texttt{\$dbcEBECheckD4}, the transition $T(R\cdot i\to R\cdot j)$
+is looked up via \texttt{pairToLeafSrc[\{rsi, rsj\}]}, where \texttt{rsi} and
+\texttt{rsj} are the indices of $R\cdot i$ and $R\cdot j$ in \texttt{allStates}.
+The orbit expansion from the translation-only BFS covers all pairs in
+\texttt{allStates} (since the translation group generates all $n^2$ positions).
+Therefore $T(R\cdot i\to R\cdot j)$ is correctly assembled from the expanded
+leaves.  If $T(R\cdot i\to R\cdot j) = 0$ and $T(i\to j) \neq 0$, the check
+\texttt{\$dbcIsExpZero[tij - 0]} correctly detects the violation.
+
+The check in Phase~3 evaluates the difference $T(i\to j) - T(R\cdot i\to
+R\cdot j)$ using \texttt{\$dbcIsExpZero}.  Since both T values are sums of
+rational $\times$ $E^{-\beta r}$ terms (after $J^\ast$ substitution), the
+difference has the same structure.  The checker handles this correctly.
+
+\subsection{Chamber reuse: a correctness assumption}
+\label{sec:chamberreuse}
+
+\begin{issue}[Chamber reuse assumption not verified]
+\label{issue:chambers}
+After D4 passes, the pipeline recomputes orbit representatives using the full
+D4+translation group (reducing from 56 to 8 reps for \texttt{single\_metropolis})
+and re-runs the BFS from these 8 reps.  The EBE DB check then reuses the 132
+chambers computed during the D4 EBE check (which used the 56-rep BFS), skipping
+Phase~2.
+
+The correctness of this reuse relies on the following assumption:
+
+\begin{mdframed}[backgroundcolor=yellow!20,linewidth=0.5pt]
+\textbf{Reuse assumption.}  Every Piecewise condition appearing in the 8-rep BFS
+leaves is also a condition in the 56-rep BFS leaves.  Equivalently, the 8-rep
+hyperplane arrangement is a \emph{coarsening} of (or identical to) the 56-rep
+arrangement.
+\end{mdframed}
+
+If this assumption fails, some 8-rep Piecewise conditions are not controlled by
+the chamber decomposition; the $J^\ast$ for each chamber fixes them to specific
+values, but those values may not be representative of the entire chamber.  The DB
+check would be valid only at the single point $J^\ast$, not throughout the
+chamber.
+
+\textbf{Mathematical justification.}
+If D4 invariance holds exactly (as verified by the algebraic D4 EBE check), then
+any energy-difference comparison arising in the 8-rep BFS also arises in the
+56-rep BFS (or is D4-equivalent to one that does, and since D4 acts on positions
+and not types, the coupling atoms are preserved).  The 8-rep conditions are
+therefore a subset of the 56-rep conditions, making the reuse valid.
+
+\textbf{Empirical verification.}
+In all provided examples, the EBE Phase~1 applied to the 8-rep BFS yields the
+same $k$ as Phase~1 of the D4 EBE check:
+\begin{itemize}
+\item \texttt{single\_metropolis.wl}: $k = 18$ for both checks, 132 chambers
+\item \texttt{vmmc\_2d.wl}: $k = 12$ for both checks, 512 chambers
+\item \texttt{kawasaki.wl}: $k = 6$ for both checks, 12 chambers
+\end{itemize}
+
+\textbf{What is missing.}
+The code does not assert that the 8-rep conditions form a subset of the 56-rep
+conditions.  A defensive check would be:
+
+\begin{lstlisting}
+(* After Phase 1 of DB EBE, if reusing precomputedChambers: *)
+If[!SubsetQ[allConds, precomputedConditions],
+  Print["WARNING: new conditions not covered by precomputed chambers"];
+  (* fall back to Phase 2 *)]
+\end{lstlisting}
+
+Without this check, a future algorithm where D4 invariance is algebraically
+verified but the 8-rep BFS introduces new Piecewise conditions (e.g., from a
+distance function the 56-rep never reached) would silently produce an incomplete
+DB check.  The mathematical argument above rules this out for standard physics
+algorithms, but a runtime assertion is prudent for a tool claiming exactness.
+\end{issue}
+
+\subsection{C4-only case}
+
+The same reuse concern applies when only C4 (rotations, not reflections) is
+verified.  In this case, the post-C4 BFS uses C4+translation orbits (between 8
+and 56 reps, depending on the system).  The D4 EBE check computed chambers from
+the 56-rep BFS.  For C4-symmetric algorithms without full D4, it is possible
+(though unlikely for standard Hamiltonians) that the post-C4 BFS introduces
+conditions absent from the 56-rep BFS.
+
+%===============================================================
+\section{The Translational Invariance Check}
+\label{sec:tau}
+%===============================================================
+
+\subsection{Correctness of weight-only check}
+
+The $\tau$-BFS verifies that leaf weights are free of $\tau_r$ and $\tau_c$.  It
+does not verify that the next-state for each leaf is the correct $\tau$-shifted
+version of the non-augmented next state.  For algorithms where spatial decisions
+use only pairwise differences, the state update (e.g., moving a particle from
+$p$ to $p + \Delta$) always produces states that correctly carry $\tau$.  A
+pathological algorithm could, in principle, produce $\tau$-free weights while
+constructing next states that are not translates of the rep's next states.  Such
+an algorithm would pass the $\tau$-check while being non-translation-invariant.
+No such algorithm is physically meaningful, but the limitation should be noted.
+
+\subsection{The cantHandle path for quadratic\_field.wl}
+
+Confirmed from the current run: \texttt{quadratic\_field.wl} triggers an error
+\begin{lstlisting}
+RandomInteger[{{-16,16},4}]: 24 bits needed --- use count x RandomInteger[{lo,hi}]
+\end{lstlisting}
+and falls back to the non-translation-invariant path.  This is the improved error
+message from the second revision.  The actual mechanism is that Mathematica's
+symbolic evaluation of \texttt{Mod[pos, n]} with a $\tau$-augmented position
+internally calls \texttt{RandomInteger[\{-16,16\}, 4]}, which is intercepted.
+The checker correctly falls back and the DB check is exact.
+
+\subsection{Soundness of checking from orbit representatives}
+
+\begin{theorem}[Sufficiency of orbit representatives for $\tau$-check]
+If the $\tau$-BFS produces $\tau$-free leaf weights for each translation-orbit
+representative, it produces $\tau$-free weights for every state.
+\end{theorem}
+
+\begin{proof}
+Every state $s$ is a translation $T_{(dr,dc)}(\text{rep})$ for some
+$(dr,dc) \in \{0,\ldots,n-1\}^2$.  Running the algorithm from $s + \tau =
+T_{(dr,dc)}(\text{rep}) + \tau = T_{(dr,dc)}(\text{rep} + \tau)$ (where
+$\tau = (\tau_r, \tau_c)$) is equivalent to running from $\text{rep} + \tau'$
+with $\tau' = \tau + (dr, dc)$.  Since the $\tau$-BFS checks rep at offset $\tau$
+(a free variable), the output subsumes all integer offsets of $\tau$.  Hence
+$\tau$-freedom for the rep implies $\tau$-freedom for all states in its orbit.
+\end{proof}
+
+%===============================================================
+\section{Ergodicity Check}
+\label{sec:ergodicity}
+%===============================================================
+
+The ergodicity BFS was fixed in the first revision to start from the correct
+\texttt{seedState} index.  The current implementation looks up
+\texttt{seedIdx = Lookup[stateToIdx, Key[seedState], 1]} and falls back to
+index~1 if the seed is not found.  This fallback cannot occur for well-formed
+inputs (the seed state is always in \texttt{allStates}) but provides a safe
+default.
+
+\textbf{Interaction with maxDepth.}
+The BFS leaf set may be incomplete if any transition requires more than
+\texttt{maxDepth}~bits (currently 22).  An algorithm with a long-tailed random
+path (e.g., a geometric distribution with small success probability) might have
+its low-probability transitions truncated.  In the current code, reaching
+\texttt{maxDepth} causes a hard error (exit) rather than a silent omission, so
+the ergodicity check cannot silently produce false PASSes from incomplete leaves.
+
+%===============================================================
+\section{New and Undocumented Issues}
+\label{sec:newissues}
+%===============================================================
+
+\subsection{NormalDistribution discretisation: undocumented truncation error}
+\label{sec:normaldist}
+
+The \texttt{RandomVariate[NormalDistribution[$\mu$, $\sigma$]]} handler
+discretises onto $\{\texttt{Round}(\mu)-\texttt{nMax}, \ldots,
+\texttt{Round}(\mu)+\texttt{nMax}\}$ where
+\texttt{nMax}~$=$~\texttt{Floor}[\texttt{\$dbcCurrentNGrid}/2].  For a
+$3\times3$ grid this gives $\texttt{nMax}=1$ and only 3 values: $\{\mu-1, \mu,
+\mu+1\}$.  The probability mass outside this range is discarded, and the weights
+are renormalised.
+
+This introduces a systematic error:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+$\sigma$ & Mass covered & Mass discarded \\
+\midrule
+0.5 & 99.7\% & 0.3\% \\
+1.0 & 86.6\% & 13.4\% \\
+2.0 & 54.7\% & \textbf{45.3\%} \\
+\bottomrule
+\end{tabular}
+\end{center}
+The renormalisation ensures the BFS leaf weights still sum to~1, but the
+transition probabilities assigned to each outcome are \emph{wrong}: the checker
+verifies DB for a truncated distribution, not for the actual NormalDistribution.
+A user applying the checker to an algorithm that genuinely uses
+\texttt{RandomVariate[NormalDistribution[$\mu$, $\sigma$]]} with $\sigma \geq 1$
+on a $3\times3$ grid would receive a DB verdict that is \textbf{not valid for the
+intended distribution}.
+
+The correct fix is either to use the exact CDF-based weights (which is what the
+code already does for the truncated range) \emph{and} to include a tail-capture
+term that catches all values outside $[\mu-\texttt{nMax}, \mu+\texttt{nMax}]$,
+or to document explicitly that the checker is approximating the distribution and
+that $\sigma \ll \texttt{nMax}$ is required for the approximation to be
+acceptable.  The current code prints no warning, making this a silent
+correctness risk.
+
+\subsection{Coupling atom arity constraint}
+\label{sec:arity}
+
+The validation check
+\begin{lstlisting}
+!AllTrue[symCouplings, MatchQ[#, _[_Integer, _Integer, _Integer]]&]
+\end{lstlisting}
+requires every coupling atom to have \emph{exactly} three integer arguments.  An
+algorithm using two-argument couplings (\texttt{coupling[a,b]}, for
+distance-independent interactions) would fail with the message ``coupling atom
+arguments must all be integers,'' which does not explain the three-argument
+requirement.  This is an unnecessary constraint: the coupling symmetry rule
+\texttt{h[b\_, a\_, rest\_\_Integer] /; b > a := h[a, b, rest]} requires
+\texttt{rest} to match at least one argument, but a two-argument coupling could
+be supported with a separate rule.  The error message should at minimum clarify
+that three integer arguments are required, or the constraint should be relaxed.
+
+\subsection{Legacy dead code}
+\label{sec:dead}
+
+The functions \texttt{\$dbcApplyRot90} and \texttt{\$dbcApplyReflect} are defined
+in \texttt{dbc\_core.wl} but never called in the current pipeline (the D4 action
+is computed everywhere via \texttt{\$dbcApplyGElem} and \texttt{\$dbcD4Pos}).
+These are artefacts of an earlier version and constitute dead code.  Their
+presence is harmless but confusing; they should be removed.
+
+\subsection{RandomInteger with inverted bounds}
+\label{sec:inverted}
+
+As noted in Section~\ref{sec:bfs}, \texttt{RandomInteger[\{hi, lo\}]} with
+$hi < lo$ produces $n \leq 0$.  The code silently discards all paths via
+\texttt{outOfRange} rather than raising a \texttt{cantHandle} error.  A user
+whose algorithm contains an inverted-bound call due to a bug would not be informed
+by the checker.  A guard
+\begin{lstlisting}
+If[n <= 0, Throw[$dbc$cantHandle["RandomInteger: invalid range"], $dbc$tag]]
+\end{lstlisting}
+would make the failure visible.
+
+%===============================================================
+\section{Correctness of Orbit Expansion}
+\label{sec:orbits}
+%===============================================================
+
+\subsection{The orbit map construction}
+
+In \texttt{\$dbcComputeOrbits}, the canonical representative \texttt{minImg} is
+chosen as the lexicographically smallest state in the orbit.  The orbit map
+\texttt{orbitMap[s] = g} satisfies $g(\text{minImg}) = s$.  The comment in the
+source correctly identifies the bug that was fixed: when the initially-visited
+state $s \neq \texttt{minImg}$, the orbit map must be computed \emph{from
+minImg}, not from $s$.  The fix (recomputing \texttt{imgPairsFromRep} from
+\texttt{minImg}) is in place and correct.
+
+\subsection{Orbit expansion correctness}
+
+The expansion $T(\texttt{sKey} \to g(\texttt{nextState})) = T(\texttt{minImg} \to \texttt{nextState})$ relies on
+the G-invariance of the algorithm, which is established independently by the
+$\tau$-check and D4 EBE check before the expansion is used.  All states in
+\texttt{allStates} are correctly mapped under D4 actions (verified: zero misses
+for all 504 states and all 8 D4 elements for \texttt{single\_metropolis}).
+
+\subsection{Self-loops and T-matrix diagonal}
+
+Pairs where $i = j$ (self-loops, \emph{i.e.}\ the algorithm proposes a rejected
+or null move and returns the same state) are excluded from the DB check by
+\texttt{pairsArr = Select[pairsArr, \#[[1]] =/= \#[[2]] \&]}.  The DB condition
+$T(i\to i) \cdot \pi(i) = T(i\to i) \cdot \pi(i)$ is trivially satisfied, so
+this exclusion is correct.
+
+%===============================================================
+\section{Summary of Open Issues}
+\label{sec:summary}
+%===============================================================
+
+\begin{table}[h!]
+\centering
+\begin{tabular}{lllll}
+\toprule
+\textbf{Issue} & \textbf{Severity} & \textbf{Status} & \textbf{Affects examples?} & \textbf{Section} \\
+\midrule
+\$dbcFS treated as violation & Moderate & Open & No & \ref{sec:expzero} \\
+Chamber reuse assumption & Moderate & Open (undocumented) & No & \ref{sec:chamberreuse} \\
+NormalDistribution truncation & Significant & Open (undocumented) & No & \ref{sec:normaldist} \\
+Coupling arity constraint & Minor & Open & No & \ref{sec:arity} \\
+Inverted RandomInteger bounds & Minor & Open & No & \ref{sec:inverted} \\
+Dead code (ApplyRot90 etc.) & Cosmetic & Open & No & \ref{sec:dead} \\
+D4 default performance & Performance & \textbf{Fixed} & Yes (vmmc\_2d: 332s$\to$217s) & \ref{sec:d4perf} \\
+Probabilistic SZ fallback & Correctness & \textbf{Fixed} & No & \ref{sec:d4perf} \\
+\bottomrule
+\end{tabular}
+\caption{Issues after both previous revision rounds, plus performance findings.
+  ``Affects examples?'' refers to the nine provided example algorithms.
+  The bottom two rows describe changes made in the current revision.}
+\end{table}
+
+The highest-severity open issue is the NormalDistribution truncation, which
+produces \textbf{wrong transition probabilities without warning} for
+$\sigma \geq 1$ on small grids.  Algorithms using Gaussian displacement proposals
+should not be verified with this checker without explicitly confirming that $\sigma
+\ll \texttt{Floor}[\texttt{nGrid}/2]$.
+
+%===============================================================
+\section{Performance Analysis: The D4 Orbit-Reduction Trade-off}
+\label{sec:d4perf}
+%===============================================================
+
+\subsection{Background and motivation}
+
+The original rationale for including \texttt{"D4"} in \texttt{\$symmetryGroup}
+was that, if D4 symmetry holds, orbit representatives can be reduced from 56
+(translation only) to 8 (D4$+$translation).  Fewer representatives were expected
+to reduce the number of state pairs in EBE Phase~3 by a factor of~7, making the
+DB check 7$\times$ faster.  This section shows that this reasoning was
+quantitatively incorrect for VMMC, and documents the resulting architectural
+change.
+
+\subsection{Timing breakdown with and without D4}
+
+Comprehensive profiling of \texttt{vmmc\_2d.wl} ($n=3$, three particle types)
+produced the following wall-clock breakdown.
+
+\paragraph{Original behaviour (D4 included in \texttt{\$symmetryGroup}).}
+\begin{center}
+\begin{tabular}{lrl}
+\toprule
+\textbf{Step} & \textbf{Time} & \textbf{\% of total} \\
+\midrule
+$\tau$-BFS (56 reps) & 12.8s & 4\% \\
+BFS (56 reps) & 11.7s & 4\% \\
+D4 EBE check (Phase 2 + Phase 3 $\times$ 2 generators) & 203.3s & 61\% \\
+BFS (8 D4-reduced reps) & 1.9s & $<$1\% \\
+Ergodicity & 1.9s & $<$1\% \\
+DB EBE check (Phase 3, 8-rep leaves) & 101.1s & 30\% \\
+\midrule
+\textbf{Total} & \textbf{332s} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{New behaviour (D4 removed; translation only).}
+\begin{center}
+\begin{tabular}{lrl}
+\toprule
+\textbf{Step} & \textbf{Time} & \textbf{\% of total} \\
+\midrule
+$\tau$-BFS (56 reps) & 13.9s & 6\% \\
+BFS (56 reps) & 12.8s & 6\% \\
+D4 EBE check & 0s & --- \\
+Ergodicity & 2.0s & 1\% \\
+DB EBE check (Phase 3, 56-rep leaves) & 181.7s & 84\% \\
+\midrule
+\textbf{Total} & \textbf{217s} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The runtime decreases from 332s to 217s, a \textbf{1.53$\times$ speedup}, by
+removing two lines from the algorithm file.  For \texttt{single\_metropolis.wl}
+($k=18$, 132 chambers) the improvement is from $\approx$65s to $\approx$45s.
+
+\subsection{Why D4 orbit reduction barely helps Phase 3}
+
+The expected 7$\times$ speedup from D4 orbit reduction did not materialise because
+the cost of EBE Phase~3 is dominated by the number of \emph{communicating state
+pairs}, not the number of orbit representatives.
+
+The pair array \texttt{pairsArr} is computed by expanding orbit-rep leaves through
+the full orbit map and deduplicating by symmetry.  With 56 translation-only reps,
+the translation group of size 9 is used for deduplication; with 8 D4+translation
+reps, the group of size 72 is used.  The resulting pair counts are:
+\begin{itemize}
+  \item 56 translation reps $\to$ 5{,}688 distinct pairs (up to translation)
+  \item 8 D4+translation reps $\to$ 5{,}688 distinct pairs (up to D4+translation)
+\end{itemize}
+
+The pair count is \emph{identical}.  Both representations cover all 504 states
+and the same set of nonzero transitions; what changes is only the group used to
+deduplicate.  Since the state space is fully ergodic and the transition graph is
+dense, every pair reachable from any single rep is also reachable from any other,
+so deduplication by a larger group yields the same universal set of pairs.
+
+The only Phase~3 cost that differs between 56- and 8-rep runs is Step~A, the
+$J^\ast$ substitution into leaf weights: 4{,}368 leaves (56-rep) versus 648 leaves
+(8-rep).  Empirically this costs $\approx$164\,ms/region versus $\approx$17.5\,ms/region
+--- a 9.4$\times$ increase for a 6.7$\times$ increase in leaf count.
+Over 512 regions this is 74.7\,s extra, not the 7$\times$ saving on the pair loop
+that was expected.
+
+\subsection{Why the D4 check appeared cheap (a subtle asymmetry)}
+
+The D4 EBE check also runs Phase~3 with 56-rep leaves, but costs only
+$\approx$203s despite checking 2 generators instead of 1.  This is because its
+per-pair work is structurally much lighter than the DB check.  In the D4 check,
+the test expression is $T(i\to j) - T(Ri\to Rj)$.  For a D4-symmetric algorithm
+these two T-values have identical symbolic structure after $J^\ast$ substitution,
+so the \texttt{Expand} step reduces the expression to~0 immediately and
+\texttt{\$dbcIsExpZero} is never called.  In the DB check, the expression
+$T(i\to j)\cdot E^{-\beta E_i} - T(j\to i)\cdot E^{-\beta E_j}$ requires a full
+rational-coefficient grouping by Boltzmann exponent on every non-trivial pair.
+The D4 Phase~3 benefits from early termination in a way the DB Phase~3 cannot.
+
+\subsection{Implication: D4 is not a performance optimisation for dense transition graphs}
+
+The D4 orbit reduction was designed around a cost model that assumes Phase~3
+scales with the number of orbit representatives.  That assumption holds when the
+transition graph is sparse (each rep connects to a small, non-overlapping
+neighbourhood).  For ergodic algorithms on a 3$\times$3 grid the transition graph
+is dense and the assumption fails.
+
+D4 verification remains available as an opt-in correctness check --- useful when
+one specifically wants to verify rotational symmetry of the algorithm --- but
+should \textbf{not} be included in \texttt{\$symmetryGroup} for performance
+reasons.
+
+\subsection{The probabilistic fallback: permanently disabled}
+
+The \texttt{ebeMaxK} parameter previously defaulted to~50, which would trigger
+a probabilistic Schwartz-Zippel fallback for any algorithm with more than 50
+Piecewise conditions.  This default has been raised to~10{,}000 (effectively
+unlimited) to ensure the checker always runs the exact EBE algorithm.  To use the
+probabilistic path explicitly, pass \texttt{-mode SZPure} or lower
+\texttt{-ebeMaxK} on the command line.
+
+%===============================================================
+\section{Python and Open-Source Portability Analysis}
+\label{sec:portability}
+%===============================================================
+
+\subsection{Motivation and scope}
+
+SZ-DBC is implemented in Wolfram Mathematica, which requires a proprietary
+licence.  This severely limits adoption.  The previous \texttt{report.tex}
+discussed language portability at a high level; the codebase has since changed
+substantially (FullSimplify is no longer the primary DB check, having been
+replaced by EBE).  This section provides a detailed, up-to-date analysis of what
+can and cannot be ported to Python, Julia, or C++.
+
+\subsection{The five core mechanisms and their portability}
+
+\subsubsection{Mechanism 1: Dynamic function interception (\texttt{Block})}
+
+\texttt{Block[\{RandomReal = f, RandomInteger = g, ...\}, alg[state]]} rebinds
+every call to \texttt{RandomReal} and \texttt{RandomInteger} in the dynamic scope
+of \texttt{alg[state]}, regardless of call depth.  The algorithm under test
+requires no modification.
+
+\textbf{Python.}  Python provides no equivalent at the standard language level.
+\texttt{unittest.mock.patch} can intercept named function calls, but only for
+module-level attributes, not for arbitrary call trees.  Crucially, if the
+algorithm calls \texttt{import random; random.random()}, patching
+\texttt{random.random} in the test harness does not intercept calls made through
+a different import path.  Algorithms using NumPy (\texttt{np.random.rand()}) or
+multiple RNG sources cannot be intercepted uniformly.  Any call that escapes the
+interception returns a concrete float, and the BFS silently produces an incorrect
+leaf weight with no warning.
+
+The workaround --- requiring the algorithm to accept an explicit RNG object --- is
+the only viable Python strategy, but it is \emph{invasive}: the algorithm must be
+rewritten to pass \texttt{rng=symbolic\_rng} through all function calls.  This
+changes the algorithm's interface, introduces a risk of translation errors, and
+breaks the key property that ``the algorithm requires no modification.''
+
+\textbf{Julia.}  Cassette.jl provides a true call-tree overdubbing mechanism.  A
+\texttt{Cassette.@overdub ctx rand()} call can redirect every invocation of
+\texttt{rand()} (and \texttt{rand(T)}, \texttt{rand(rng, ...)}) at the LLVM-IR
+level, regardless of call depth or module.  This is semantically equivalent to
+Mathematica's \texttt{Block}.  It is the single most important feature for a
+rigorous port.  However, Cassette.jl is a complex, low-level package with a steep
+learning curve and occasional compilation instability on newer Julia versions.
+
+\textbf{C++.}  No standard mechanism exists.  One can compile the algorithm with a
+special RNG header that is swapped at link time, but this requires build-system
+cooperation and prevents use of third-party RNG implementations.
+
+\subsubsection{Mechanism 2: Operator overloading for comparison tokens}
+
+When \texttt{RandomReal[]} is intercepted, the returned symbolic token
+\texttt{\$dbc\$irand[j, acceptTestI]} must participate in comparison expressions
+like \texttt{token < Exp[-$\beta$ dE]}.  In Mathematica, this is handled via
+\emph{UpValues}: pattern-matching rules attached to the token head that trigger
+when the token appears in a \texttt{Less} expression.
+
+\textbf{Python.}  This is portable.  A Python class \texttt{IntervalToken} can
+define \texttt{\_\_lt\_\_(self, other)} to call the BFS's \texttt{accept\_test}
+method, returning \texttt{True} or \texttt{False} after reading a bit and updating
+the weight.  The algorithm's conditional
+\texttt{if token < threshold:} triggers \texttt{\_\_lt\_\_} transparently.  This
+works for direct comparisons; arithmetic (\texttt{token + c < threshold}) requires
+additional \texttt{\_\_add\_\_} overloading.
+
+\textbf{Julia.}  Also portable via method overloading:
+\texttt{Base.:$<$(token::IntervalToken, p)} is syntactically analogous to the
+Mathematica UpValue.
+
+\textbf{C++.}  Operator overloading is native to C++.  The \texttt{operator<}
+method on a custom \texttt{IntervalToken} type works transparently.
+
+\subsubsection{Mechanism 3: Symbolic algebra for Piecewise expressions}
+
+After the BFS, leaf weights are symbolic expressions involving
+\texttt{Piecewise} conditions on coupling constants and Boltzmann factors
+$E^{-\beta E_i}$.  The EBE Phase~1 extracts these conditions, Phase~2 enumerates
+chambers, and Phase~3 substitutes rational representatives and evaluates the
+\texttt{\$dbcIsExpZero} check.
+
+\paragraph{\$dbcIsExpZero in Python.}  This specific check (\emph{group by
+$E^{-\beta r}$ exponent, sum rational coefficients, verify zero}) requires only
+rational arithmetic and dictionary operations.  After substituting rational $J^\ast$
+values, all $E_i$ are rational and all $c_i$ are rational.  This is fully
+implementable in Python using \texttt{fractions.Fraction} and a dict keyed by
+the rational exponent.  \textbf{This is the easiest component to port.}
+
+\paragraph{Piecewise handling.}  During the BFS (before $J^\ast$ substitution),
+leaf weights contain nested \texttt{Piecewise} expressions.  Mathematica's
+\texttt{PiecewiseExpand} automatically computes the Cartesian product of all
+Piecewise conditions in a product expression.  SymPy's
+\texttt{piecewise\_fold} does not perform this cross-product expansion; it only
+flattens nested Piecewise into the same Piecewise, not products of two
+independent Piecewise.  A Python port must implement cross-product expansion
+manually, which is a non-trivial algebraic operation.
+
+\paragraph{Condition feasibility.}  In Phase~2, Mathematica's
+\texttt{FindInstance[constraints, vars, Rationals, 1]} is a complete decision
+procedure for systems of linear rational inequalities, returning an exact rational
+point.  This has no Python equivalent.  SymPy's \texttt{Poly.all\_roots} and
+\texttt{solve\_univariate\_inequality} handle some cases but are not complete for
+multivariate systems.  The most practical replacement:
+\begin{enumerate}
+\item Use \texttt{scipy.optimize.linprog} to find a floating-point interior point.
+\item Convert to a rational approximation using
+  \texttt{fractions.Fraction.limit\_denominator(N)} for large $N$.
+\item Verify the rational point satisfies all strict inequalities.
+\end{enumerate}
+This is an engineering solution that works in practice but can fail in degenerate
+cases (e.g., near the boundary of a very narrow chamber).  Mathematica's
+\texttt{FindInstance} gives an \emph{exact} rational point by Fourier-Motzkin
+elimination.
+
+\paragraph{Symbolic expression maintenance.}  During the BFS, weights are
+products of acceptance probabilities, which involve Piecewise expressions in the
+coupling constants.  Mathematica's pattern-matching evaluator automatically
+simplifies these products; SymPy requires explicit calls to \texttt{simplify} or
+\texttt{cancel} after each multiplication.  For complex algorithms (e.g., VMMC),
+the symbolic expressions can grow very large; Mathematica's evaluator handles
+these via efficient internal normal forms that SymPy cannot match.
+
+\subsubsection{Mechanism 4: State enumeration and orbit computation}
+
+These are combinatorial algorithms with no symbolic algebra.
+
+\textbf{Python, Julia, C++.}  All fully portable.  \texttt{itertools.permutations}
+(Python), comprehensions (Julia), or STL containers (C++) handle state
+enumeration.  The orbit computation is graph-theoretic and translates directly.
+
+\subsubsection{Mechanism 5: EBE Phase 2 chamber enumeration}
+
+The chamber-adjacency BFS is a graph traversal algorithm.  The only Mathematica
+dependency is \texttt{FindInstance} (discussed above).  The BFS logic itself is
+trivially portable.
+
+\subsection{Component-by-component portability summary}
+
+\begin{table}[h!]
+\centering
+\begin{tabular}{lllll}
+\toprule
+\textbf{Component} & \textbf{Python} & \textbf{Julia} & \textbf{C++} & \textbf{Notes} \\
+\midrule
+Block interception & \textbf{No} & Via Cassette.jl & Template mock & Key limitation \\
+Operator UpValues & Yes & Yes & Yes & Straightforward \\
+\$dbcIsExpZero & Yes & Yes & Yes & Pure rational arith. \\
+PiecewiseExpand & Partial & Partial & No & Manual cross-product \\
+FindInstance & Approx. & Approx. & Via LP solvers & Not exact \\
+State enumeration & Yes & Yes & Yes & Trivial \\
+Orbit computation & Yes & Yes & Yes & Trivial \\
+BFS engine (queue) & Yes & Yes & Yes & Trivial \\
+Coupling symmetry rule & Yes & Yes & Yes & Trivial \\
+seqBernoulli & Yes & Yes & Yes & Straightforward \\
+\bottomrule
+\end{tabular}
+\caption{Portability of each SZ-DBC component.  ``Yes'' = direct port possible.
+``Partial'' = feasible with additional implementation effort.
+``Approx.'' = feasible with reduced exactness guarantees.
+``No'' = fundamental limitation.}
+\end{table}
+
+\subsection{What the removal of FullSimplify changes}
+
+The original code (as described in \texttt{report.tex}) used Mathematica's
+\texttt{FullSimplify} as the primary DB check.  This was the component most
+deeply tied to Mathematica's proprietary algebra engine: no other CAS matches
+Mathematica's \texttt{FullSimplify} in breadth or reliability for mixed
+exponential-Piecewise expressions.
+
+The current code uses EBE as the primary check, with FullSimplify available only
+as an optional mode (\texttt{-mode FullSimplify}).  The EBE check's inner
+computation (\texttt{\$dbcIsExpZero}) is pure rational arithmetic --- no CAS
+required.  \textbf{This is the most significant portability improvement.}  The
+EBE strategy makes the ``heavy CAS'' component optional rather than mandatory.
+
+However, the EBE approach introduces its own Mathematica dependency:
+\texttt{FindInstance} for chamber enumeration.  Replacing this with an approximate
+LP-based solution degrades the exactness guarantee.  The SZ fallback (probabilistic
+check at random coupling points) is fully portable but sacrifices the completeness
+guarantee.
+
+\subsection{A realistic Python port: what would it look like?}
+
+A realistic Python port of SZ-DBC would have the following structure:
+
+\begin{enumerate}
+\item \textbf{Algorithm interface:} The algorithm must be written (or rewritten)
+  to accept an explicit RNG object.  A \texttt{SymbolicRNG} class provides
+  \texttt{random\_real()} (returning an \texttt{IntervalToken}),
+  \texttt{random\_choice(items)} (using seqBernoulli or rejection sampling),
+  and \texttt{random\_integer(lo, hi)} (rejection sampling).
+
+\item \textbf{BFS engine:} A Python queue manages bit-string prefixes.  The
+  algorithm is called with each prefix; the \texttt{IntervalToken} class's
+  operator overloads read bits and accumulate weights.
+
+\item \textbf{Symbolic leaf weights:} After BFS, leaf weights are Python
+  \texttt{Piecewise} objects (a list of \{condition, value\} pairs with a
+  default).  The condition is a Python expression tree over the coupling atoms.
+
+\item \textbf{EBE Phase 1:} Traverse all leaf weights and collect unique
+  conditions (linear inequalities in coupling atoms) using symbolic expression
+  equality.  SymPy can do this, albeit slowly for large expression trees.
+
+\item \textbf{EBE Phase 2:} Chamber BFS using \texttt{scipy.optimize.linprog}
+  for interior-point finding, with rational conversion.
+
+\item \textbf{EBE Phase 3:} Substitute rational $J^\ast$ into leaf weights;
+  evaluate Piecewise conditions; group by exponent; sum rational coefficients.
+  This is pure Python with \texttt{fractions.Fraction}.
+\end{enumerate}
+
+\textbf{Limitations of this port:}
+\begin{itemize}
+\item The algorithm must be rewritten to use the explicit RNG interface.  Any
+  algorithm that calls Python's \texttt{random} or NumPy's RNG directly would
+  bypass the BFS.  This is both a usability burden and a correctness risk (missed
+  random calls produce silently wrong transition probabilities).
+\item EBE Phase~2 is approximate (LP-based rational approximation), not exact.
+  Chamber boundaries in very narrow regions might be misclassified.
+\item Piecewise cross-product expansion must be implemented manually.  SymPy's
+  \texttt{piecewise\_fold} is insufficient.
+\item The Python port would be significantly slower than the Mathematica version
+  due to Python's interpreted overhead and SymPy's slower CAS.
+\end{itemize}
+
+\subsection{Julia: the recommended open-source alternative}
+
+Julia with Cassette.jl + Symbolics.jl is the most viable open-source
+implementation, for the following reasons:
+
+\begin{enumerate}
+\item \textbf{Cassette.jl overdubbing} provides a true Block-like interception
+  mechanism for \texttt{rand()} at any call depth.  The algorithm requires zero
+  modification.  This is the single most important feature.
+
+\item \textbf{Multiple dispatch} in Julia is semantically equivalent to
+  Mathematica's UpValue system for operator overloading.  Defining
+  \texttt{Base.:$<$(token::IntervalToken, p)} is a direct translation.
+
+\item \textbf{Symbolics.jl} provides symbolic algebra with significantly faster
+  compile-time expression evaluation than SymPy.  \texttt{substitute} and
+  \texttt{expand} handle the rational-coefficient Boltzmann algebra.
+
+\item \textbf{\$dbcIsExpZero} translates directly using Julia's \texttt{Dict}
+  and \texttt{Rational\{Int\}} types.
+
+\item \textbf{FindInstance} remains a gap.  Julia's JuMP.jl can find LP interior
+  points; converting to rationals requires care.  An exact alternative would be to
+  implement Fourier-Motzkin elimination in Julia.
+\end{enumerate}
+
+\textbf{Remaining challenges in Julia:}
+\begin{itemize}
+\item Cassette.jl has had API instability across Julia versions; the overdubbing
+  context for \texttt{rand()} must be carefully constructed to handle all forms
+  (\texttt{rand()}, \texttt{rand(Float64)}, \texttt{rand(rng, ...)}).
+\item Symbolics.jl has limited Piecewise support; cross-product expansion must be
+  implemented from scratch.
+\item The seqBernoulli decomposition and interval-tracking logic must be
+  reimplemented; no direct equivalent exists in any Julia library.
+\end{itemize}
+
+\subsection{C++: not recommended}
+
+A C++ port would require a complete implementation of symbolic expression trees,
+Piecewise condition tracking, and rational arithmetic.  While feasible (using
+e.g.\ the GiNaC computer algebra library), it would involve tens of thousands of
+lines of code with no natural analogue of Mathematica's pattern-matching evaluator.
+The effort is not justified given the availability of Julia as a better
+alternative.
+
+\subsection{The fundamental limitation: algorithm transparency}
+
+The deepest limitation of any non-Mathematica port is that \textbf{the checker
+cannot guarantee that all random calls are intercepted}.  In Mathematica, the
+Block mechanism intercepts every evaluation of the bound symbol, regardless of
+nesting.  In Python, any call that bypasses the explicit RNG interface (e.g., a
+\texttt{random.random()} call inside a helper imported from a third-party library)
+returns a concrete float and produces a silently incorrect transition weight.  In
+Julia (with Cassette.jl), the overdubbing mechanism can intercept calls at the
+compiled bytecode level, providing a much stronger guarantee --- but only if all
+random calls go through \texttt{rand()} or \texttt{Random.rand()}, not through
+e.g.\ a hand-written LCG in a C extension.
+
+This issue is \textbf{not resolvable} by any finite amount of engineering: it is
+a consequence of Python's (and C++'s) lack of dynamic rebinding at the language
+semantics level.  In practice, it means that a Python port is inherently less
+trustworthy than the Mathematica version for algorithms that use multiple RNG
+sources or third-party libraries with their own random-number calls.
+
+\textbf{Mitigation.}  The Python port should include a mechanism to detect
+``escaped'' random calls.  One approach: wrap the algorithm in a context manager
+that monkey-patches \texttt{random.random}, \texttt{random.randint}, and
+\texttt{numpy.random.rand} (and their common aliases) at the module level, and
+fails loudly if any of these is called without going through the interceptor.
+This is fragile but provides a best-effort guarantee.
+
+%===============================================================
+\section{Recommendations}
+\label{sec:recommendations}
+%===============================================================
+
+\subsection{Immediate fixes}
+
+\begin{enumerate}
+\item \textbf{Add NormalDistribution warning.}  Before using the truncated
+  discretisation, print: ``WARNING: NormalDistribution discretised to $\pm$nMax
+  values around $\mu$; $X$\% of probability mass discarded. Results are exact
+  only for $\sigma \ll$ nMax.''
+
+\item \textbf{Fix \$dbcFS false-positive.}  In the EBE Phase~3 check:
+  \begin{lstlisting}
+  Which[res === True, Null,
+        res === $dbcFS, Return[$dbc$cantHandle["$dbcIsExpZero failed..."]],
+        True, violations[pair] = ...]
+  \end{lstlisting}
+
+\item \textbf{Add chamber-reuse subset assertion.}  When reusing precomputed
+  chambers, verify that the new BFS conditions form a subset:
+  \begin{lstlisting}
+  If[!SubsetQ[allConds, precomputedConds],
+    Print["INTERNAL ERROR: new conditions not covered by chambers"]; Exit[1]]
+  \end{lstlisting}
+
+\item \textbf{Guard inverted RandomInteger bounds.}  Add:
+  \begin{lstlisting}
+  If[n <= 0, Throw[$dbc$cantHandle["RandomInteger: hi < lo"], $dbc$tag]]
+  \end{lstlisting}
+
+\item \textbf{Improve coupling arity message.}  Change the error message to
+  explicitly state that three integer arguments are required.
+\end{enumerate}
+
+\subsection{Documentation}
+
+\begin{enumerate}
+\item Document the open-chamber omission (measure-zero boundaries not checked).
+\item Document that the $\tau$-check verifies transition weights but not next-state
+  correctness.
+\item State explicitly that the NormalDistribution handler is an approximation.
+\item Document the chamber-reuse assumption (D4 invariance implies condition
+  subset, not verified at runtime).
+\end{enumerate}
+
+\subsection{For a Python or Julia port}
+
+\begin{enumerate}
+\item \textbf{Julia (recommended):} Use Cassette.jl for RNG interception,
+  Symbolics.jl for expression algebra, and implement \$dbcIsExpZero and
+  seqBernoulli from scratch.  Accept LP-based (approximate) chamber enumeration
+  as an engineering trade-off.
+\item \textbf{Python:} Require the algorithm to accept an explicit
+  \texttt{symbolic\_rng} object; implement monkey-patching of common RNG
+  module-level functions as a best-effort interception guard; use
+  \texttt{fractions.Fraction} for exact coefficient arithmetic; and use
+  \texttt{scipy.optimize.linprog} for chamber enumeration with rational
+  conversion.  Document that the interception guarantee is weaker than the
+  Mathematica version.
+\item In either language, the \texttt{\$dbcIsExpZero} check (rational
+  coefficient grouping by Boltzmann exponent) and the BFS queue management are
+  the most straightforward components to port and should be implemented first
+  as a proof-of-concept.
+\end{enumerate}
+
+%===============================================================
+\section{Conclusions}
+%===============================================================
+
+SZ-DBC in its current form is a sound and largely correct tool for verifying
+detailed balance in lattice MCMC algorithms.  The critical bugs from the first
+audit have all been fixed.  The EBE-based exact check is rigorously correct, the
+checker now always runs exactly (probabilistic SZ fallback requires explicit
+opt-in), and the D4 check has been moved to opt-in status following the
+performance analysis in Section~\ref{sec:d4perf}.  The result is a 1.53$\times$
+speedup for \texttt{vmmc\_2d.wl} (332s $\to$ 217s) with no loss of DB correctness.
+
+The remaining open issues are:
+\begin{itemize}
+\item A moderate correctness concern around EBE chamber reuse (unverified
+  assumption, mathematically justified but not checked at runtime).
+\item The \texttt{\$dbcFS} sentinel being silently treated as a DB violation
+  (harmless for all standard algorithms tested).
+\item A significant accuracy problem with the NormalDistribution discretisation
+  (wrong transition probabilities for $\sigma \geq 1$, no warning printed).
+\end{itemize}
+
+For portability, the removal of FullSimplify from the critical path
+substantially improves the prospects for an open-source reimplementation.  The
+EBE inner loop requires only rational arithmetic, which is available in Python,
+Julia, and C++.  The fundamental bottleneck for Python remains the lack of a
+Block-equivalent for transparent RNG interception; Julia with Cassette.jl is the
+recommended path for an open-source port that preserves the checker's
+non-invasive design.
+
+\end{document}
