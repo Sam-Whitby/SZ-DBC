@@ -105,8 +105,9 @@ $dbcAddCouplingSymmetry[symCouplings];
    The symmetry rule and SZ substitution only work correctly for integer
    type labels {1,2,3,...}.  Reject non-integer labels immediately. *)
 If[Length[symCouplings] > 0 &&
-   !AllTrue[symCouplings, MatchQ[#, _[_Integer, _Integer, _Integer]]&],
-  Print["ERROR: coupling atom arguments must all be integers."];
+   !AllTrue[symCouplings, (MatchQ[#, _[__Integer]] && Length[#] >= 2)&],
+  Print["ERROR: coupling atom arguments must all be integers with at least two arguments."];
+  Print["  Supported forms: couplingJ[type1, type2] or couplingJ[type1, type2, dist]."];
   Print["  Particle types must be positive integers {1, 2, 3, ...}."];
   Print["  Got: ", symCouplings];
   Exit[1]];
@@ -272,7 +273,7 @@ $runBFS[repsIn_List] :=
     {leavesNew, errNew}];
 
 d4Result = <|"d4Pass" -> False, "label" -> "not checked"|>;
-rotCheck  = <|"pass" -> False, "ebe" -> False, "chambers" -> {}|>;
+rotCheck  = <|"pass" -> False, "ebe" -> False, "chambers" -> {}, "conds" -> {}|>;
 
 If[wantD4 && tauResult["tauFree"] === True,
   printSection["Step 5b: Rotational invariance check (D4)"];
@@ -393,7 +394,11 @@ If[mode === "SZPure",
     allStates, nGrid, symParamList,
     ebeMaxK, szRepeats, 1*^-7,
     If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
-       rotCheck["chambers"], {}]]]];
+       rotCheck["chambers"], {}],
+    If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
+       rotCheck["conds"], {}]]]];
+If[MatchQ[violations, $dbc$cantHandle[_]],
+  Print["  ERROR: ", violations[[1]]]; Exit[1]];
 
 Print["  Time: ", Round[AbsoluteTime[]-t8, 0.01], "s"];
 If[violations === {},

@@ -10,11 +10,11 @@
    - TRANSLATIONAL INVARIANCE verified algebraically via τ-BFS:
      runs from orbit representatives (not full state space) so
      that the τ check costs ~2 s instead of ~135 s.
-   - D4 ROTATIONAL INVARIANCE verified numerically (SZ-style) at
-     random parameter points — more robust than structural equality.
+   - D4 ROTATIONAL INVARIANCE verified algebraically via EBE:
+     exact check over all coupling-parameter regions.
    - ERGODICITY verified via reachability BFS on the orbit-expanded
      transition graph derived from the orbit-rep BFS output.
-   - SCHWARTZ-ZIPPEL probabilistic DB check (default, no FS).
+   - EBE (Exhaustive Branch Enumeration) exact DB check (default).
    - FULL-SIMPLIFY available as an option.
 
    Load with:  Get["path/to/dbc_core.wl"]
@@ -22,6 +22,7 @@
 
 $dbcDir = DirectoryName[$InputFileName];
 $dbcCurrentNGrid = 1;
+$dbcNormalDistWarnShown = False;
 
 
 (* ================================================================
@@ -67,19 +68,14 @@ $dbcAddCouplingSymmetry[symCouplings_List] :=
   Module[{heads = DeleteDuplicates[Head /@ symCouplings]},
     Do[
       With[{h = heads[[i]]},
-        h[b_Integer, a_Integer, rest__Integer] /; b > a := h[a, b, rest]],
+        h[b_Integer, a_Integer, rest__Integer] /; b > a := h[a, b, rest];
+        h[b_Integer, a_Integer] /; b > a := h[a, b]],
       {i, Length[heads]}]]
 
 
 (* ================================================================
    SECTION 1 — GROUP ACTIONS ON STATES
    ================================================================ *)
-
-$dbcApplyRot90[state_List, nGrid_Integer] :=
-  $dbcNormState[Map[{{#[[1,2]], nGrid+1-#[[1,1]]}, #[[2]]} &, state], nGrid]
-
-$dbcApplyReflect[state_List, nGrid_Integer] :=
-  $dbcNormState[Map[{{#[[1,2]], #[[1,1]]}, #[[2]]} &, state], nGrid]
 
 $dbcApplyTrans[state_List, dr_Integer, dc_Integer, nGrid_Integer] :=
   $dbcNormState[
@@ -292,7 +288,13 @@ RunWithBitsAT[alg_, state_, bits_List] :=
             args==={}||args==={1}, readBit[],
             MatchQ[args,{{_Integer,_Integer}}],
               Module[{lo=args[[1,1]], hi=args[[1,2]], n, k, val},
-                n=hi-lo+1; If[n==1,lo,
+                n=hi-lo+1;
+                If[n <= 0,
+                  Throw[$dbc$cantHandle[
+                    "RandomInteger[{"<>ToString[lo]<>","<>ToString[hi]<>
+                    "}]: inverted range (hi < lo) — likely a bug in the algorithm"],
+                    $dbc$tag]];
+                If[n==1,lo,
                   k=IntegerLength[n-1,2]; val=$dbc$readBitsAsInt[k,readBit];
                   If[val>=n, Throw[$dbc$outOfRange,$dbc$tag], weight*=2^k/n; lo+val]]],
             MatchQ[args,{_Integer?NonNegative}],
@@ -342,12 +344,22 @@ RunWithBitsAT[alg_, state_, bits_List] :=
             MatchQ[args,{HoldPattern[UniformDistribution[{_,_}]]}],
               makeContToken[args[[1,1,1]], args[[1,1,2]]],
             MatchQ[args,{HoldPattern[NormalDistribution[_,_]]}],
-              Module[{mu=args[[1,1]],sigma=args[[1,2]],nMax,vals,rawW},
+              Module[{mu=args[[1,1]],sigma=args[[1,2]],nMax,vals,rawW,covered},
                 nMax=Floor[$dbcCurrentNGrid/2];
                 vals=Range[Round[mu]-nMax,Round[mu]+nMax];
                 rawW=Table[CDF[NormalDistribution[mu,sigma],k+1/2]-
                            CDF[NormalDistribution[mu,sigma],k-1/2],{k,vals}];
-                seqBernoulli[rawW/Total[rawW],vals]],
+                covered=Total[rawW];
+                If[!$dbcNormalDistWarnShown && NumericQ[N[covered]] && N[covered] < 0.99,
+                  $dbcNormalDistWarnShown = True;
+                  Print["  NOTE: NormalDistribution[",mu,",",sigma,
+                        "] discretised to ",Length[vals]," integer values in [",
+                        Round[mu]-nMax,",",Round[mu]+nMax,"]; ",
+                        Round[(1-N[covered])*100,0.1],
+                        "% of probability mass lies outside this range and is discarded. ",
+                        "The checker verifies DB for this discretised distribution. ",
+                        "For symmetric (mu=0) proposals this does not affect PASS/FAIL."]];
+                seqBernoulli[rawW/covered,vals]],
             True, Throw[$dbc$cantHandle["RandomVariate: unsupported"],$dbc$tag]]]],
         RandomPermutation = Function[Module[{args={##},list,n,perm},
           Which[
@@ -775,7 +787,8 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
                    ebeMaxK_Integer : 50,
                    szFallbackReps_Integer : 30,
                    tol_ : 1*^-7,
-                   precomputedChambers_ : {}] :=
+                   precomputedChambers_ : {},
+                   precomputedConds_ : {}] :=
   Module[{nStates, stateToIdx, energyExprs,
           allGKeys, gIdxOf, gActI, repList, repOrbitPairs, pairsArr,
           pairToLeafSrc,
@@ -871,14 +884,19 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
        ============================================================
        If precomputedChambers are provided (e.g., from the D4 EBE
        check which ran Phase 2 over the same hyperplane arrangement),
-       reuse them directly and skip Phase 2.  This halves the total
-       FindInstance cost when D4 and DB conditions are the same set.
+       reuse them when the new BFS conditions are a subset of the
+       precomputed conditions — guaranteed by D4 invariance.
+       The SubsetQ assertion catches any violation of this assumption.
        ============================================================ *)
     feasibleRegions = {};
-    If[precomputedChambers =!= {},
+    If[precomputedChambers =!= {} &&
+         (precomputedConds === {} || SubsetQ[precomputedConds, allConds]),
       feasibleRegions = precomputedChambers;
       Print["  EBE: ", Length[feasibleRegions],
             " feasible region(s) (reused from D4 EBE check)"],
+      If[precomputedChambers =!= {},
+        Print["  EBE: WARNING — chamber reuse skipped: new BFS conditions are not ",
+              "a subset of D4 EBE conditions. Running Phase 2 from scratch."]];
     If[k == 0 || Length[allSymParams] == 0,
       (* No Piecewise conditions: single trivial region *)
       feasibleRegions = {{Table[1, {k}], {}}};
@@ -956,16 +974,24 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
             If[expr === 0, Continue[]];
 
             res = $dbcIsExpZero[expr];
-            If[res =!= True,
-              If[!KeyExistsQ[violations, pair],
-                violations[pair] =
-                  <|"pair"   -> {allStates[[i]], allStates[[j]]},
-                    "tij"    -> tij,    "tji"   -> tji,
-                    "ei"     -> ei,     "ej"    -> ej,
-                    "region" -> sigma,
-                    "jStar"  -> jStarAssign|>];
-              If[Length[violations] >= 10,
-                done = True; Break[]]]],
+            Which[
+              res === True, Null,
+              res === $dbcFS,
+                Return[$dbc$cantHandle[
+                  "EBE Phase 3: $dbcIsExpZero could not resolve the DB expression " <>
+                  "at pair " <> ToString[pair] <> ". The algorithm may produce " <>
+                  "Exp[f(\[Beta])] terms where f is non-linear (e.g., Exp[Sin[\[Beta]]]). " <>
+                  "This form is not supported by the EBE exact check."], Module],
+              True,
+                If[!KeyExistsQ[violations, pair],
+                  violations[pair] =
+                    <|"pair"   -> {allStates[[i]], allStates[[j]]},
+                      "tij"    -> tij,    "tji"   -> tji,
+                      "ei"     -> ei,     "ej"    -> ej,
+                      "region" -> sigma,
+                      "jStar"  -> jStarAssign|>];
+                If[Length[violations] >= 10,
+                  done = True; Break[]]]],
 
           {pair, pairsArr}]],
 
@@ -1199,7 +1225,7 @@ $dbcEBECheckD4[repLeaves_Association, repToOrbitMap_Association,
       Return[Append[$dbcCheckRotational[
                repLeaves, repToOrbitMap, allStates, nGrid,
                allSymParams, rotIdxsToCheck, numFallbackReps],
-                    "ebe" -> False, "chambers" -> {}]]];
+                    "ebe" -> False, "chambers" -> {}, "conds" -> {}]]];
 
     (* ============================================================
        PHASE 2 — Region enumeration via arrangement BFS
@@ -1292,11 +1318,13 @@ $dbcEBECheckD4[repLeaves_Association, repToOrbitMap_Association,
 
       {rgn, Length[feasibleRegions]}];
 
-    (* Return feasibleRegions so the DB EBE check can reuse them,
-       avoiding a duplicate Phase 2 (FindInstance) enumeration. *)
+    (* Return feasibleRegions and allConds so the DB EBE check can reuse
+       them, avoiding a duplicate Phase 2 (FindInstance) enumeration.
+       allConds is passed back for the SubsetQ safety check in Phase 2. *)
     <|"pass" -> (violations === {}), "violations" -> violations,
       "ebe" -> True,
-      "chambers" -> feasibleRegions|>]
+      "chambers" -> feasibleRegions,
+      "conds" -> allConds|>]
 
 
 (* ================================================================
