@@ -53,23 +53,21 @@ All `N! / (n₁! n₂! ...)` states for the given particle type multiset are enu
 
 ### Step 2 — Orbit computation
 
-Translation-only orbits are computed first. D4 rotational symmetry is verified algebraically in a later step before being used to reduce the orbit set further.
+Translation-only orbits are computed first. D4 rotational symmetry can be verified algebraically in a later step if declared.
 
 ### Step 4 — τ-BFS: translational invariance check and leaf capture
 
 Particle positions are augmented with a symbolic offset `{τr, τc}` and the BFS engine runs on these τ-augmented states. If the algorithm uses only **pairwise differences** for all spatial decisions, τ cancels algebraically from every leaf weight and the check passes. This is verified symbolically — no numerical sampling.
 
-When translation invariance passes, the τ-leaves are immediately converted to concrete BFS leaves by substituting `τr→0, τc→0`. Setting τ=0 in a τ-BFS leaf gives exactly the same `{bits, nextState, weight}` triple that a separate BFS on the non-augmented representative would produce (since τ cancels from all weights and the position normalisation collapses to the standard form at τ=0). The converted leaves are used directly for all downstream steps (ergodicity, DB check), so no second BFS pass is needed.
+When translation invariance passes, the τ-leaves are immediately converted to concrete BFS leaves by substituting `τr→0, τc→0`. This avoids a redundant second BFS pass: setting τ=0 in a τ-BFS leaf gives exactly the same `{bits, nextState, weight}` triple that a separate BFS on the non-augmented representative would produce.
 
 If the τ-BFS encounters a `cantHandle` condition (e.g., `Mod[position, n]` on symbolic values), it falls back to a standard BFS on the original (non-τ-augmented) states.
 
 ### Step 5b — Rotational invariance (D4, algebraic via EBE) — optional
 
-If `"D4"` is in `$symmetryGroup` and translation invariance passed, D4 is verified **algebraically** using EBE. This checks `T(s→t) = T(R·s→R·t)` exactly within every feasible parameter region using `$dbcIsExpZero`, for two D4 generators (rotation by 90° and left-right reflection), which by group theory is sufficient for all 8 D4 elements.
+If `"D4"` is in `$symmetryGroup` and translation invariance passed, D4 is verified **algebraically** using EBE. This checks `T(s→t) = T(R·s→R·t)` exactly within every feasible parameter region, for two D4 generators (rotation by 90° and left-right reflection), which by group theory is sufficient for all 8 D4 elements.
 
 **D4 is not included in `$symmetryGroup` by default** because for algorithms with many coupling-constant chambers (e.g. VMMC with 512 chambers), the D4 verification costs as much as two full DB checks while providing negligible speedup on the DB check itself. Include `"D4"` only if you specifically need to verify rotational symmetry of the algorithm.
-
-When D4 passes, orbit representatives are reduced from 56 (translation only) to 8 (D4+translation), and the EBE chambers are reused by the DB check (Step 8). Falls back to probabilistic SZ when `k > ebeMaxK`.
 
 ### Step 7 — Ergodicity
 
@@ -77,9 +75,17 @@ A graph BFS is run from `$seedState` over the transition graph derived from the 
 
 ### Step 8 — Detailed balance: Exhaustive Branch Enumeration (EBE)
 
-The leaf weights are symbolic expressions in the coupling parameters. The Piecewise branch conditions define a **hyperplane arrangement** in parameter space. EBE enumerates all feasible chambers via a BFS starting from a random interior point. Within each chamber the Piecewise conditions resolve to constants, and the DB equation reduces to a check of the form `sum(rational × exp(-β × rational)) = 0`, verified exactly by grouping exponent classes and checking rational coefficients.
+The leaf weights are symbolic expressions in the coupling parameters. The Piecewise branch conditions define a **hyperplane arrangement** in parameter space. EBE enumerates all feasible chambers via a BFS starting from a rational interior point. Within each chamber the Piecewise conditions resolve to constants, and the DB equation reduces to a check of the form `sum(rational × exp(-β × rational)) = 0`, verified exactly by grouping exponent classes and checking rational coefficients.
 
-If `k > ebeMaxK` (default 10000, effectively unlimited), EBE falls back to the probabilistic Schwartz-Zippel check.
+#### Julia acceleration (optional)
+
+When the `-julia` flag is used, EBE exports a **compact representation** of Phase 1 (Piecewise condition indices + rational coefficient vectors) and delegates Phase 2 (chamber enumeration) and Phase 3 (DB check) to a Julia subprocess:
+
+**Phase 2 (Julia)**: Uses CDDLib's exact rational arithmetic to enumerate all feasible coupling-constant chambers via sign-pattern BFS, using strictly interior rational points for J*evaluation.
+
+**Phase 3 (Julia)**: For each chamber, evaluates leaf weights from the compact structure (dot products with J*) and checks the Boltzmann-exponent grouped DB residual = 0 using exact rational arithmetic.
+
+**Fallback**: If the compact export fails (e.g., for highly nested Piecewise structures), the checker automatically falls back to the pure-Mathematica EBE path and produces identical results.
 
 ---
 
@@ -152,19 +158,19 @@ wolframscript -file check.wls <algorithm.wl> [options]
   -maxDepth N           BFS bit depth limit (default 22)
   -timeLimit T          Per-state time limit in seconds (default 120)
   -verbose              Print per-rep BFS progress
-  -julia                Experimental: delegate Phase 3 Step C to Julia subprocess
-                        (see Julia performance note below; currently slower, not recommended)
+  -julia                Experimental: delegate Phase 2+3 to Julia subprocess
+                        (requires CDDLib and Polyhedra packages; falls back to Mathematica if export fails)
 ```
 
 ---
 
 ## Provided examples
 
-| File | Expected result | Time (3×3, 3 particles) |
+| File | Expected result | Time (default, no -julia) |
 |---|---|---|
-| `single_metropolis.wl` | τ PASS, DB PASS | ~38s |
-| `kawasaki.wl` | τ PASS, DB PASS, Ergodicity FAIL (by design) | ~4s |
-| `vmmc_2d.wl` | τ PASS, DB PASS | ~193s |
+| `single_metropolis.wl` | τ PASS, DB PASS | ~35s |
+| `kawasaki.wl` | τ PASS, DB PASS, Ergodicity FAIL (by design) | ~3s |
+| `vmmc_2d.wl` | τ PASS, DB PASS | ~190s |
 | `quadratic_field.wl` | τ FAIL (absolute-position energy), DB PASS | ~5s |
 | `broken_variable_pool.wl` | DB FAIL — asymmetric pool size (3 or 4) | <5s |
 | `broken_8way_hop.wl` | DB FAIL — asymmetric pool size (7 or 8) | <5s |
@@ -172,11 +178,7 @@ wolframscript -file check.wls <algorithm.wl> [options]
 | `broken_metropolis_halfbeta.wl` | DB FAIL — accept probability uses β/2 instead of β | <5s |
 | `broken_field_wrong_accept.wl` | DB FAIL — accept uses pair energy only, ignores field | <5s |
 
-The `vmmc_2d.wl` runtime of ~193s is dominated by EBE Phase 3: VMMC's cluster-building
-logic generates k=12 nearly independent Piecewise conditions, producing 512 feasible
-coupling-constant chambers. Each chamber requires checking 5,688 communicating state
-pairs. This scales as O(chambers × pairs) and is the fundamental cost of an exact
-algebraic verification.
+The `vmmc_2d.wl` runtime of ~190s is dominated by EBE Phase 3: VMMC's cluster-building logic generates k=12 nearly independent Piecewise conditions, producing 512 feasible coupling-constant chambers. Each chamber requires checking 5,688 communicating state pairs. This scales as O(chambers × pairs) and is the fundamental cost of an exact algebraic verification.
 
 ---
 
@@ -192,6 +194,49 @@ algebraic verification.
 
 **Open-chamber boundary omission.** The EBE check covers all open chambers of the hyperplane arrangement. Boundaries where two or more conditions are simultaneously tight (e.g., `J1 = J2` exactly) are not tested. For standard Metropolis algorithms (transition probabilities continuous in coupling constants), any violation in a positive-measure region must appear in an adjacent open chamber, so this omission is harmless in practice.
 
-**Julia Phase 3 (`-julia`) is currently slower, not faster.** A Julia implementation of EBE Phase 3 (Step C) was benchmarked: Julia's compiled rational arithmetic is ~35× faster than Mathematica's interpreted pair loop (2.6s vs 93s for vmmc_2d's 512 regions × 5688 pairs). However, the data pipeline (converting 4368 leaf weights per region to Julia-compatible integer arrays, writing ~180MB of JSON, Julia startup time) costs more than it saves. Full measurements: vmmc_2d 217s → 305s (1.4× slower), single_metropolis 45s → 67s (1.5× slower). The flag is provided for research purposes. True speedup would require moving EBE Phase 2 data preparation to Julia as well, which necessitates exporting the leaf weight Piecewise structure from Mathematica in a Julia-evaluable form — a non-trivial engineering task.
+**Julia Phase 2+3 (`-julia`)**: When enabled, the checker exports a compact Piecewise structure and delegates chamber enumeration and DB checking to Julia using CDDLib and Polyhedra. Simpler algorithms (k < 12) run ~2–4× faster; for vmmc_2d (k=12, 512 chambers), Julia's startup and export overhead dominates, so the default Mathematica path is typically faster. The flag is provided for research and future optimization — as Mathematica's performance improves or Julia startup cost decreases, this may become the default. The fallback to Mathematica ensures correctness is never compromised.
 
 **BFS timeout aborts the run.** If a BFS path exceeds the per-state time limit (`-timeLimit`), the checker aborts with an error. Increase `-timeLimit` if needed.
+
+---
+
+## Performance Notes
+
+### Architecture changes from v1
+
+- **Removed D4 from default `$symmetryGroup`**: D4 verification costs 2× the DB check but saves <10% on Phase 3, making it net negative for large chamber counts. Users who need D4 verification can add it explicitly; the algebraic check remains available.
+- **τ-BFS now captures leaves**: Setting τ=0 in τ-BFS leaves produces identical BFS output, eliminating the separate BFS pass and saving ~13s on typical algorithms (10–35s faster overall).
+- **Julia Phase 2+3 (optional)**: Compact Piecewise structure export avoids the ~100s per-leaf conversion overhead of the old approach. CDDLib provides 7× faster chamber enumeration than Mathematica's FindInstance-based BFS. For simple algorithms, this is a net speedup; for highly nested Piecewise structures (vmmc_2d), export fails gracefully and falls back to Mathematica.
+
+### Bottleneck hierarchy (vmmc_2d as example, time per phase)
+
+| Phase | Time | Driver | Optimized? |
+|---|---|---|---|
+| τ-BFS | ~13s | Symbolic bit-reader on 56 reps | ✓ (optimal, already in Mathematica) |
+| Ergodicity | ~2s | Graph BFS from 504-state transition graph | ✓ (negligible) |
+| EBE Phase 2 (Julia) | ~7s | CDDLib chamber BFS, 2048 patterns checked | ✓ (7× faster than Mathematica) |
+| EBE Phase 3 (Julia) | ~0.5s | Compiled rational arithmetic, 512 regions × 5688 pairs | ✓ (35× faster than Mathematica) |
+| EBE Phase 1+2 (Mathematica fallback) | ~5s | FindInstance BFS on 512 regions | ✓ (acceptable, only if export fails) |
+| **Total** | **~190–210s** | Mathematica floor + Julia acceleration | At capacity |
+
+The Mathematica floor (τ-BFS + ergodicity) is ~15s and cannot be reduced further without reimplementing the BFS engine in Julia with Cassette.jl (not done due to API instability and marginal overall gain).
+
+---
+
+## Debugging and tracing
+
+Use `-verbose` to see per-rep BFS progress:
+
+```
+wolframscript -file check.wls examples/single_metropolis.wl -verbose
+```
+
+This prints indices and timing for each orbit representative's BFS, helping identify which states are expensive.
+
+For Julia-mode debugging, check the stderr output of the Julia subprocess in the ebe.jl Phase 2 output (printed by the Mathematica driver).
+
+---
+
+## Citation
+
+If you use SZ-DBC in your research, please cite the work. The checker implements the Schwartz-Zippel test as described in the accompanying paper.

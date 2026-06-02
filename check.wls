@@ -48,7 +48,7 @@ timeLimit  = ToExpression[parseOpt["-timeLimit", "120"]];
 ebeMaxK    = ToExpression[parseOpt["-ebeMaxK",   "10000"]];
 verbose    = parseBool["-verbose"];
 useJulia   = parseBool["-julia"];
-juliaScript = FileNameJoin[{DirectoryName[$InputFileName], "julia_poc", "phase3.jl"}];
+juliaScript = FileNameJoin[{DirectoryName[$InputFileName], "julia_poc", "ebe.jl"}];
 
 
 (* ---- Load core library ---- *)

@@ -1013,29 +1013,26 @@ $dbcEBECheckLeaves[repLeaves_Association, repToOrbitMap_Association,
 
 
 (* ================================================================
-   SECTION 7c-Julia — EXPORT PHASE 3 DATA + JULIA-ACCELERATED DB CHECK
+   SECTION 7c-Julia — COMPACT STRUCTURE EXPORT + JULIA PHASE 2+3
    ================================================================
-   Exports all data needed for EBE Phase 3 to a JSON file, then calls
-   a Julia subprocess to run Steps A and C for all feasible regions.
-   Julia runs the same exact rational DB check as the Mathematica code,
-   but ~30× faster for Step C (compiled tight loop vs WL interpreter).
+   Exports a COMPACT representation of EBE Phase 1 data (leaf weight
+   Piecewise structure + coupling-constant linear forms) to JSON once.
+   Julia then runs BOTH Phase 2 (CDDLib chamber BFS, ~8s) and Phase 3
+   (compact evaluation + DB check, ~0.5s).
 
-   Step A in Julia: for each leaf weight, evaluate the pre-extracted
-   linear-form representation at each J* assignment to obtain rational
-   (c, v) pairs where weight = Σ c_k * exp(-β * v_k).
+   Compared to the old approach (jStar substitution per chamber per
+   leaf = ~158s): compact export takes ~0.2s because PiecewiseExpand
+   is called once per UNIQUE leaf weight (217 for vmmc_2d), not once
+   per (chamber, leaf) pair (2.24M for vmmc_2d).
 
-   Step C in Julia: same grouping-by-exponent DB check as $dbcIsExpZero.
-
-   The Mathematica floor (BFS + Phase 2 + ergodicity ≈ 34s) cannot be
+   The Mathematica floor (τ-BFS + ergodicity ≈ 16s) cannot be
    reduced by Julia; achievable total speedup is approximately 5-6×.
    ================================================================ *)
 
-(* Convert a POST-J* leaf weight (rational Boltzmann expression) to a list of
-   {c_num, c_den, v_num, v_den} integer quadruples, where the weight =
-   Σ c_k * Exp[-β * v_k] with c_k and v_k rational.
-   After J* substitution, WL auto-simplifies Exp[a]*Exp[b]→Exp[a+b], so
-   $dbcMergeExp is not needed; plain Expand suffices.
-   Returns $dbcFS if the weight cannot be represented in this form.          *)
+(* ----------------------------------------------------------------
+   $dbcLeafWeightToTerms — kept for use by $dbcEBECheckLeaves (Mathematica path).
+   Converts a POST-J* leaf weight to {c_num, c_den, v_num, v_den} quadruples.
+   ---------------------------------------------------------------- *)
 $dbcLeafWeightToTerms[w_] :=
   Module[{expanded, terms, result = {}, c, ep, v},
     expanded = Expand[w];
@@ -1044,24 +1041,19 @@ $dbcLeafWeightToTerms[w_] :=
     Do[
       With[{t = terms[[k]]},
         Switch[Head[t],
-          (* Pure integer or rational constant *)
           Integer | Rational,
             AppendTo[result, {Numerator[t], Denominator[t], 0, 1}],
-          (* E^(exponent) — coefficient = 1 *)
           Power,
             If[t[[1]] =!= E, Return[$dbcFS, Module]];
             v = Expand[t[[2]] / (-\[Beta])];
             If[!MatchQ[v, _Rational | _Integer], Return[$dbcFS, Module]];
             AppendTo[result, {1, 1, Numerator[v], Denominator[v]}],
-          (* Times[...] product — find E^... factor at top level only *)
           Times,
             ep = FirstCase[List @@ t, Power[E, _], $Failed];
             If[ep === $Failed,
-              (* No Exp factor — entire term is the coefficient *)
               c = t;
               If[!MatchQ[c, _Rational | _Integer], Return[$dbcFS, Module]];
               AppendTo[result, {Numerator[c], Denominator[c], 0, 1}],
-              (* Exp factor found — extract coefficient and exponent *)
               c = Cancel[t / ep];
               v = Expand[ep[[2]] / (-\[Beta])];
               If[!MatchQ[c, _Rational | _Integer], Return[$dbcFS, Module]];
@@ -1072,26 +1064,106 @@ $dbcLeafWeightToTerms[w_] :=
       {k, Length[terms]}];
     result]
 
-(* Export Phase 3 data to a JSON file for the Julia phase3.jl script.
-   Architecture: Mathematica performs Step A (substituting J* into leaf weights)
-   for all feasible regions upfront.  Julia receives pre-evaluated rational (c,v)
-   pairs and only needs to run Step C (the pair-loop DB check).
-   Only needed leaves (non-self-loop transitions) are exported.
-   Returns True on success, $Failed on error.                               *)
-$dbcExportPhase3JSON[repLeaves_Association, repToOrbitMap_Association,
-                     energy_, allStates_List, nGrid_Integer,
-                     allSymParams_List, feasibleRegions_List,
-                     outFile_String] :=
+
+(* ================================================================
+   COMPACT EXPORT — helpers for Julia Phase 2+3
+   ================================================================
+   Instead of substituting J* per chamber (expensive), export the
+   symbolic Piecewise structure once.  Julia handles Phase 2 (CDDLib
+   chamber BFS) and Phase 3 (compact evaluation + DB check).
+
+   Key insight: vmmc_2d has only 217 unique leaf weights. Calling
+   PiecewiseExpand once per unique weight (~1.2s total) is vastly
+   cheaper than the old approach (~158s: jStar substitution per
+   chamber per leaf = 512 chambers x 4368 leaves x 70us each).
+   ================================================================ *)
+
+(* Extract Boltzmann terms from a PiecewiseExpand clause value.
+   Each term has form c * E^(\[Beta]*L) where c rational, L linear in atoms.
+   Boltzmann exponent v = -L so weight = c * Exp[-\[Beta]*v].
+   Returns list of <|"c_num"->...,"c_den"->...,"v_coeffs"->...|>,
+   or $dbcFS if structure unrecognizable.                           *)
+$dbcCompactTerms[val_, symParamList_List, \[Beta]_] :=
+  Module[{expanded, termList, result = {}, t, args, arg, c, Lsym, vCoeffs},
+    expanded = Expand[val];
+    If[expanded === 0, Return[{}]];
+    termList = If[Head[expanded] === Plus, List @@ expanded, {expanded}];
+    Do[
+      t = termList[[k]];
+      args = Cases[t, Power[E, x_] :> x, Infinity];
+      If[args === {},
+        c = t;
+        If[!MatchQ[c, _Rational | _Integer], Return[$dbcFS, Module]];
+        vCoeffs = ConstantArray[0, Length[symParamList]],
+        If[Length[args] > 1, Return[$dbcFS, Module]];
+        arg = First[args];
+        c = Simplify[t /. Power[E, _] -> 1];
+        If[!MatchQ[c, _Rational | _Integer], Return[$dbcFS, Module]];
+        Lsym = arg /. \[Beta] -> 1;
+        vCoeffs = Table[-Coefficient[Lsym, symParamList[[j]]],
+                        {j, Length[symParamList]}];
+        If[!VectorQ[vCoeffs, IntegerQ], Return[$dbcFS, Module]]];
+      AppendTo[result, <|"c_num"->Numerator[c], "c_den"->Denominator[c],
+                         "v_coeffs"->vCoeffs|>],
+    {k, Length[termList]}];
+    result]
+
+(* Return 0-based allConds indices for conditions in a clause condition.
+   Returns $dbcFS if any condition not found in allConds.          *)
+$dbcCompactCondIdxs0[cond_, allConds_List] :=
+  Module[{condList},
+    condList = If[Head[cond] === And, List @@ cond, {cond}];
+    Table[
+      With[{pos = Flatten[Position[allConds, condList[[m]], {1}, Heads->False]]},
+        If[pos === {}, Return[$dbcFS, Module], First[pos] - 1]],
+    {m, Length[condList]}]]
+
+(* PiecewiseExpand a leaf weight and extract compact representation:
+   <|"clauses"->[{true_cond_idxs_0based, terms},...], "default_terms"->[...]|>
+   Returns $dbcFS if any part is unrecognizable.                   *)
+$dbcCompactWeight[w_, allConds_List, symParamList_List, \[Beta]_] :=
+  Module[{wExp, clauseList, clauseData, dfltTerms, val, cond, idxs, terms},
+    wExp = PiecewiseExpand[w];
+    If[Head[wExp] =!= Piecewise,
+      dfltTerms = $dbcCompactTerms[wExp, symParamList, \[Beta]];
+      If[dfltTerms === $dbcFS, Return[$dbcFS, Module]];
+      Return[<|"clauses"->{}, "default_terms"->dfltTerms|>]];
+    clauseList = Select[wExp[[1]], Length[#] == 2 &];
+    clauseData = Table[
+      val  = clauseList[[m, 1]]; cond = clauseList[[m, 2]];
+      idxs = $dbcCompactCondIdxs0[cond, allConds];
+      If[idxs === $dbcFS, Return[$dbcFS, Module]];
+      terms = $dbcCompactTerms[val, symParamList, \[Beta]];
+      If[terms === $dbcFS, Return[$dbcFS, Module]];
+      <|"true_cond_idxs"->idxs, "terms"->terms|>,
+    {m, Length[clauseList]}];
+    If[MemberQ[clauseData, $dbcFS], Return[$dbcFS, Module]];
+    dfltTerms = $dbcCompactTerms[wExp[[2]], symParamList, \[Beta]];
+    If[dfltTerms === $dbcFS, Return[$dbcFS, Module]];
+    <|"clauses"->clauseData, "default_terms"->dfltTerms|>]
+
+(* Export compact Phase 1 structure to JSON for Julia.
+   Julia handles Phase 2 (CDDLib BFS) + Phase 3 (evaluation + DB check).
+   Returns True on success, $Failed on error.                        *)
+$dbcExportCompact[repLeaves_Association, repToOrbitMap_Association,
+                  energy_, allStates_List, nGrid_Integer,
+                  allSymParams_List, allConds_List,
+                  initialSigma_List, initialJStar_List,
+                  outFile_String] :=
   Module[{nStates, stateToIdx, allGKeys, gIdxOf, gActI,
           repList, repOrbitPairs, pairsArr, pairToLeafSrc,
           neededLeaves, leafFlatIdx,
-          allLeafWeightsPerRegion, ts, wVals, stateEnergies,
+          k, n, condEffLhs, condEffSign, energyCoeffs,
+          uniqueWeights, uniqueWeightMap, uniqueWeightData, leafWeightIdx,
           pairIJData, pairJIData, data, t0},
 
     t0 = AbsoluteTime[];
     nStates = Length[allStates];
+    k = Length[allConds];
+    n = Length[allSymParams];
     stateToIdx = AssociationThread[allStates -> Range[nStates]];
 
+    (* ---- Orbit expansion (same as $dbcEBECheckLeaves) ---- *)
     allGKeys = DeleteDuplicates @ Flatten[Values /@ Values[repToOrbitMap], 1];
     gIdxOf   = AssociationThread[allGKeys -> Range[Length[allGKeys]]];
     gActI    = Table[0, {Length[allGKeys]}, {nStates}];
@@ -1099,7 +1171,6 @@ $dbcExportPhase3JSON[repLeaves_Association, repToOrbitMap_Association,
          Do[gActI[[gi, si]] = stateToIdx[$dbcApplyGElem[g, allStates[[si]], nGrid]],
             {si, nStates}]],
        {g, allGKeys}];
-
     repList = Keys[repLeaves];
     repOrbitPairs = Table[
       With[{repKey = repList[[ri]], orbitMap = repToOrbitMap[repList[[ri]]]},
@@ -1109,90 +1180,90 @@ $dbcExportPhase3JSON[repLeaves_Association, repToOrbitMap_Association,
               Keys[orbitMap]]],
           {li, Length[repLeaves[repKey]]}]],
       {ri, Length[repList]}];
-
     pairsArr = DeleteDuplicates @ Sort @ Map[Sort, Flatten[repOrbitPairs, 2]];
     pairsArr = Select[pairsArr, #[[1]] =!= #[[2]] &];
-
     pairToLeafSrc = <||>;
     Do[Scan[Function[st,
         With[{key = {st[[1]], st[[2]]}},
           pairToLeafSrc[key] = Append[Lookup[pairToLeafSrc, Key[key], {}], {ri, li}]]],
         repOrbitPairs[[ri, li]]],
       {ri, Length[repList]}, {li, Length[repOrbitPairs[[ri]]]}];
-
-    (* Only export leaves needed for non-self-loop transitions *)
     neededLeaves = Sort @ DeleteDuplicates @ Flatten[Values[pairToLeafSrc], 1];
     leafFlatIdx  = AssociationThread[neededLeaves -> Range[Length[neededLeaves]]];
 
-    (* Step A: evaluate every leaf weight at each J*.
-       Uses the same vectorised wVals computation as $dbcEBECheckLeaves —
-       each rep's entire leaf list is substituted at once, which is ~10x faster
-       than individual substitutions.  Only the needed leaves are then converted
-       to (c,v) pairs and exported. *)
-    allLeafWeightsPerRegion = Table[
-      With[{jStar = feasibleRegions[[rg, 2]]},
-        With[{wValsAll = Table[repLeaves[repList[[rj]]][[All, 3]] /. jStar,
-                               {rj, Length[repList]}]},
-          Map[Function[rl,
-            With[{w = wValsAll[[rl[[1]], rl[[2]]]]},
-              ts = $dbcLeafWeightToTerms[w];
-              If[ts === $dbcFS,
-                 Print["  Julia export: $dbcFS for leaf ", rl, " region ", rg,
-                       " — falling back to Mathematica"];
-                 Return[$Failed, Module]];
-              ts]],
-            neededLeaves]]],
-      {rg, Length[feasibleRegions]}];
+    (* ---- Condition effective-LHS: sigma[i]=1 iff eff_lhs[i].J >= 0 ---- *)
+    condEffSign = Table[If[MatchQ[allConds[[i]], _Less | _LessEqual], -1, 1], {i, k}];
+    condEffLhs  = Table[
+      condEffSign[[i]] * Table[Coefficient[allConds[[i, 1]], allSymParams[[j]]], {j, n}],
+    {i, k}];
 
-    (* State energies evaluated at each J* — rational scalars *)
-    stateEnergies = Table[
-      With[{jStar = feasibleRegions[[rg, 2]]},
-        Map[Function[si,
-          With[{e = energy[allStates[[si]]] /. jStar},
-            {Numerator[e], Denominator[e]}]],
-          Range[nStates]]],
-      {rg, Length[feasibleRegions]}];
+    (* ---- State energy coefficients (linear in coupling atoms) ---- *)
+    energyCoeffs = Table[
+      With[{Es = energy[allStates[[s]]] /. r_Real :> Rationalize[r]},
+        Table[Coefficient[Es, allSymParams[[j]]], {j, n}]],
+    {s, nStates}];
 
-    (* Pair sources mapped to flat leaf indices *)
+    (* ---- Compact unique weight structures ---- *)
+    uniqueWeights = DeleteDuplicates[
+      repLeaves[repList[[#[[1]]]]][[#[[2]], 3]] & /@ neededLeaves];
+    uniqueWeightMap = AssociationThread[uniqueWeights -> Range[0, Length[uniqueWeights]-1]];
+    uniqueWeightData = Map[
+      Function[w, $dbcCompactWeight[w, allConds, allSymParams, \[Beta]]],
+      uniqueWeights];
+    If[MemberQ[uniqueWeightData, $dbcFS],
+      Print["  Julia compact export: unrecognized leaf weight — falling back to Mathematica"];
+      Return[$Failed, Module]];
+
+    leafWeightIdx = Map[
+      Function[rl, uniqueWeightMap[repLeaves[repList[[rl[[1]]]]][[rl[[2]], 3]]]],
+      neededLeaves];
+
+    (* ---- Pair sources (0-based leaf indices) ---- *)
     pairIJData = Map[Function[pair,
-        Map[leafFlatIdx[#] &, Lookup[pairToLeafSrc, Key[{pair[[1]], pair[[2]]}], {}]]],
+        Map[leafFlatIdx[#]-1 &, Lookup[pairToLeafSrc, Key[{pair[[1]], pair[[2]]}], {}]]],
       pairsArr];
     pairJIData = Map[Function[pair,
-        Map[leafFlatIdx[#] &, Lookup[pairToLeafSrc, Key[{pair[[2]], pair[[1]]}], {}]]],
+        Map[leafFlatIdx[#]-1 &, Lookup[pairToLeafSrc, Key[{pair[[2]], pair[[1]]}], {}]]],
       pairsArr];
 
+    (* ---- Initial jStar as [[num,den],...] ---- *)
     data = <|
-      "n_states"         -> nStates,
-      "n_pairs"          -> Length[pairsArr],
-      "n_leaves"         -> Length[neededLeaves],
-      "n_regions"        -> Length[feasibleRegions],
-      "leaf_weights"     -> allLeafWeightsPerRegion,
-      "pair_states"      -> Normal[pairsArr],
-      "pair_ij_srcs"     -> pairIJData,
-      "pair_ji_srcs"     -> pairJIData,
-      "state_energies"   -> stateEnergies
+      "n_atoms"            -> n,
+      "n_conds"            -> k,
+      "n_states"           -> nStates,
+      "n_pairs"            -> Length[pairsArr],
+      "n_leaves"           -> Length[neededLeaves],
+      "cond_eff_lhs"       -> condEffLhs,
+      "state_energy_coeffs"-> energyCoeffs,
+      "initial_sigma"      -> initialSigma,
+      "initial_jstar"      -> Map[Function[rule,
+          {Numerator[rule[[2]]], Denominator[rule[[2]]]}], initialJStar],
+      "unique_weights"     -> uniqueWeightData,
+      "leaf_weight_idx"    -> leafWeightIdx,
+      "pair_states"        -> Normal[pairsArr],
+      "pair_ij_srcs"       -> pairIJData,
+      "pair_ji_srcs"       -> pairJIData
     |>;
-
     Export[outFile, data, "JSON"];
-    Print["  Julia export (Step A done): ", Round[AbsoluteTime[]-t0, 0.01], "s  (",
-          Length[pairsArr], " pairs, ", Length[feasibleRegions],
-          " regions, ", Length[neededLeaves], " needed leaves)"];
+    Print["  Julia compact export: ", Round[AbsoluteTime[]-t0, 0.01], "s  (",
+          Length[pairsArr], " pairs, ", Length[neededLeaves], " leaves, ",
+          Length[uniqueWeights], " unique weights)"];
     True]
 
 
-(* Run EBE Phase 3 via Julia subprocess.
-   juliaScript: absolute path to phase3.jl.
-   Falls back silently to Mathematica if Julia fails.                       *)
+(* Run EBE Phase 2+3 via Julia subprocess using compact export.
+   juliaScript: path to ebe.jl.
+   Falls back to Mathematica EBE if export or subprocess fails.   *)
 $dbcEBECheckLeavesJulia[repLeaves_Association, repToOrbitMap_Association,
                          energy_, allStates_List, nGrid_Integer,
                          allSymParams_List, ebeMaxK_Integer,
                          szFallbackReps_Integer, tol_,
                          precomputedChambers_, precomputedConds_,
                          juliaScript_String] :=
-  Module[{feasibleRegions, allConds, k,
-          allLeaves, tmpIn, tmpOut, exitCode, result, nStates},
+  Module[{allLeaves, allConds, k, jStar, sigma,
+          tmpIn, tmpOut, exitCode, resultText, vjson},
 
-    (* Phase 1+2: exactly as in $dbcEBECheckLeaves *)
+    (* Phase 1: extract Piecewise conditions *)
     allLeaves = Flatten[Values[repLeaves], 1];
     allConds = DeleteDuplicates @ Select[
       Flatten @ Map[Function[lf,
@@ -1205,88 +1276,52 @@ $dbcEBECheckLeavesJulia[repLeaves_Association, repToOrbitMap_Association,
     Print["  EBE: k=", k, " branch condition(s)"];
 
     If[k > ebeMaxK,
-      Print["  EBE: k=", k, " > ebeMaxK=", ebeMaxK, " — falling back to SZ"];
+      Print["  EBE: k=", k, " > ebeMaxK=", ebeMaxK, " \[LongDash] falling back to SZ"];
       Return[$dbcSZCheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
                                allSymParams, szFallbackReps, tol]]];
 
-    (* Reuse or recompute chambers *)
-    If[precomputedChambers =!= {} &&
-         (precomputedConds === {} || SubsetQ[precomputedConds, allConds]),
-      feasibleRegions = precomputedChambers;
-      Print["  EBE: ", Length[feasibleRegions],
-            " feasible region(s) (reused from D4 EBE check)"],
+    (* Get initial jStar (starting point for Julia's Phase 2 BFS) *)
+    If[k == 0 || Length[allSymParams] == 0,
+      jStar = {}; sigma = {},
+      jStar = Quiet[FindInstance[True, allSymParams, Rationals, 1]];
+      jStar = If[jStar === {} || jStar === {{}}, {}, First[jStar]];
+      sigma = Table[If[TrueQ[allConds[[i]] /. jStar], 1, 0], {i, k}]];
 
-      If[precomputedChambers =!= {},
-        Print["  EBE: WARNING — chamber reuse skipped; running Phase 2 from scratch."]];
-      If[k == 0 || Length[allSymParams] == 0,
-        feasibleRegions = {{Table[1, {k}], {}}};
-        Print["  EBE: 1 feasible region (no branch conditions)"],
-        Module[{jStar, sigma, visitedSigmas, bfsQueue, sigma2, constraints2, jStar2},
-          jStar = Quiet[FindInstance[True, allSymParams, Rationals, 1]];
-          If[jStar === {} || jStar === {{}},
-            feasibleRegions = {{Table[1,{k}],{}}};
-            Print["  EBE: 1 feasible region (fallback)"],
-            jStar = First[jStar];
-            sigma = Table[If[TrueQ[allConds[[i]] /. jStar],1,0],{i,k}];
-            visitedSigmas = <|sigma -> jStar|>;
-            feasibleRegions = {{sigma, jStar}};
-            bfsQueue = {sigma};
-            While[bfsQueue =!= {},
-              sigma = First[bfsQueue]; bfsQueue = Rest[bfsQueue];
-              Do[
-                sigma2 = ReplacePart[sigma, i -> 1-sigma[[i]]];
-                If[!KeyExistsQ[visitedSigmas, sigma2],
-                  constraints2 = And @@ Table[If[sigma2[[j]]==1, allConds[[j]], !allConds[[j]]], {j,k}];
-                  jStar2 = Quiet[FindInstance[constraints2, allSymParams, Rationals, 1]];
-                  If[jStar2 =!= {} && jStar2 =!= {{}},
-                    visitedSigmas[sigma2] = First[jStar2];
-                    AppendTo[feasibleRegions, {sigma2, First[jStar2]}];
-                    AppendTo[bfsQueue, sigma2],
-                    visitedSigmas[sigma2] = None]],
-                {i,k}]];
-            Print["  EBE: ", Length[feasibleRegions], " feasible region(s)  (",
-                  Length[visitedSigmas], " sign patterns visited via BFS)"]]]]];
+    tmpIn  = FileNameJoin[{$TemporaryDirectory, "szdbc_compact_in.json"}];
+    tmpOut = FileNameJoin[{$TemporaryDirectory, "szdbc_compact_out.json"}];
 
-    (* Export data and call Julia *)
-    tmpIn  = FileNameJoin[{$TemporaryDirectory, "szdbc_phase3_in.json"}];
-    tmpOut = FileNameJoin[{$TemporaryDirectory, "szdbc_phase3_out.json"}];
-
-    If[$dbcExportPhase3JSON[repLeaves, repToOrbitMap, energy, allStates, nGrid,
-                             allSymParams, feasibleRegions, tmpIn] === $Failed,
-      Print["  Julia Phase 3: export failed — falling back to Mathematica"];
+    If[$dbcExportCompact[repLeaves, repToOrbitMap, energy, allStates, nGrid,
+                          allSymParams, allConds, sigma, jStar, tmpIn] === $Failed,
+      Print["  Julia: compact export failed \[LongDash] falling back to Mathematica EBE"];
       Return[$dbcEBECheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
-                                allSymParams, ebeMaxK, szFallbackReps, tol,
-                                feasibleRegions, allConds]]];
+                                allSymParams, ebeMaxK, szFallbackReps, tol, {}, {}]]];
 
     exitCode = Run["julia --project=" <> DirectoryName[juliaScript] <>
                    " " <> juliaScript <> " " <> tmpIn <> " " <> tmpOut];
 
     If[exitCode =!= 0 || !FileExistsQ[tmpOut],
-      Print["  Julia Phase 3: subprocess failed (exit ", exitCode, ") — falling back to Mathematica"];
+      Print["  Julia: subprocess failed (exit ", exitCode,
+            ") \[LongDash] falling back to Mathematica EBE"];
       Return[$dbcEBECheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
-                                allSymParams, ebeMaxK, szFallbackReps, tol,
-                                feasibleRegions, allConds]]];
+                                allSymParams, ebeMaxK, szFallbackReps, tol, {}, {}]]];
 
-    With[{resultText = ReadString[tmpOut]},
-      DeleteFile[tmpIn]; DeleteFile[tmpOut];
-      (* Use string check: Julia writes {"pass":true} for PASS, {"pass":false,...} for FAIL *)
-      If[StringContainsQ[resultText, "\"pass\":true"],
-         Return[{}]];
-      (* FAIL: parse violation indices and convert back to state pairs *)
-      With[{vjson = ImportString[resultText, "JSON"]},
-        If[!AssociationQ[vjson],
-           Print["  Julia Phase 3: unparseable output — falling back to Mathematica"];
-           Return[$dbcEBECheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
-                                     allSymParams, ebeMaxK, szFallbackReps, tol,
-                                     feasibleRegions, allConds]]];
-        Map[Function[v,
-          <|"pair"   -> {allStates[[v[[1]]]], allStates[[v[[2]]]]},
-            "tij"    -> "see-julia-output",
-            "tji"    -> "see-julia-output",
-            "ei"     -> (energy[allStates[[v[[1]]]]] /. feasibleRegions[[v[[3]], 2]]),
-            "ej"     -> (energy[allStates[[v[[2]]]]] /. feasibleRegions[[v[[3]], 2]]),
-            "region" -> v[[3]]|>],
-          Lookup[vjson, "violations", {}]]]]]
+    resultText = ReadString[tmpOut];
+    DeleteFile[tmpIn]; DeleteFile[tmpOut];
+    If[StringContainsQ[resultText, "\"pass\":true"], Return[{}]];
+
+    vjson = ImportString[resultText, "JSON"];
+    If[!AssociationQ[vjson],
+      Print["  Julia: unparseable output \[LongDash] falling back to Mathematica EBE"];
+      Return[$dbcEBECheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
+                                allSymParams, ebeMaxK, szFallbackReps, tol, {}, {}]]];
+
+    Map[Function[v,
+      <|"pair" -> {allStates[[v[[1]]]], allStates[[v[[2]]]]},
+        "tij"  -> "see-julia-output", "tji" -> "see-julia-output",
+        "ei"   -> energy[allStates[[v[[1]]]]],
+        "ej"   -> energy[allStates[[v[[2]]]]],
+        "region" -> v[[3]]|>],
+      Lookup[vjson, "violations", {}]]]
 
 
 (* ================================================================
