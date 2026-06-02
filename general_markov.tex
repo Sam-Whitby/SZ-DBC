@@ -1,0 +1,884 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{mdframed}
+\usepackage{mathtools}
+\usepackage{microtype}
+\usepackage{parskip}
+
+\geometry{margin=2.5cm}
+
+\lstset{
+  basicstyle=\small\ttfamily,
+  breaklines=true,
+  frame=single,
+  language=Mathematica,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{gray},
+  stringstyle=\color{green!50!black},
+  backgroundcolor=\color{gray!5},
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+  extendedchars=true,
+  inputencoding=utf8,
+  literate={->}{{\texttt{->}}}2
+           {<|}{{\texttt{<|}}}2
+           {|>}{{\texttt{|>}}}2
+}
+
+\newmdenv[
+  backgroundcolor=blue!4,
+  linecolor=blue!40,
+  linewidth=1pt,
+  innerleftmargin=10pt,
+  innerrightmargin=10pt,
+  innertopmargin=8pt,
+  innerbottommargin=8pt
+]{infobox}
+
+\newmdenv[
+  backgroundcolor=orange!8,
+  linecolor=orange!60,
+  linewidth=1pt,
+  innerleftmargin=10pt,
+  innerrightmargin=10pt,
+  innertopmargin=8pt,
+  innerbottommargin=8pt
+]{warnbox}
+
+\newmdenv[
+  backgroundcolor=green!6,
+  linecolor=green!50!black,
+  linewidth=1pt,
+  innerleftmargin=10pt,
+  innerrightmargin=10pt,
+  innertopmargin=8pt,
+  innerbottommargin=8pt
+]{notebox}
+
+\title{\textbf{Towards a General Interface for SZ-DBC}\\[4pt]
+\large Implementation Plan for Dimension-Agnostic, Automated\\
+Detailed Balance Verification of Markov Chain Algorithms}
+\author{S.~Whitby}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introduction and Motivation}
+
+The current SZ-DBC checker verifies detailed balance for a single, fixed system
+configuration: one specific lattice size, one specific particle multiset, one
+specific spatial dimension (2D). These parameters are all hard-coded in the
+algorithm file itself. This design conflates two concerns that should be
+separate: the \emph{physics} of the algorithm under test, and the
+\emph{infrastructure} needed to run the test.
+
+This report describes a comprehensive plan to give SZ-DBC a general,
+dimension-agnostic interface. The goal is threefold:
+
+\begin{enumerate}
+  \item An algorithm file should contain only the essential physics: the spatial
+    dimension, the particle types, the transition rule, the energy function, and
+    the coupling atoms. Everything else --- seed state construction, lattice
+    size, particle count --- is generated automatically by the checker.
+
+  \item The checker should sweep over all relevant system sizes and particle
+    counts up to user-specified maxima, running the full BFS and DB
+    verification at each point and aggregating the results into a single
+    PASS/FAIL verdict.
+
+  \item The framework should extend naturally to higher-dimensional systems,
+    including \emph{phase-space} algorithms where each particle carries both a
+    position and a momentum (or velocity), enabling verification of a richer
+    class of physically important algorithms such as lattice kinetic Monte
+    Carlo methods.
+\end{enumerate}
+
+Section~\ref{sec:architecture} describes the three-layer architecture.
+Section~\ref{sec:interface} specifies the new algorithm file interface.
+Section~\ref{sec:sweep} describes the automated seed-state sweep.
+Section~\ref{sec:ddim} covers the $D$-dimensional generalisation of the core
+library.  Section~\ref{sec:phasespace} addresses phase-space algorithms with
+position and momentum, including the design of an archetypal example algorithm.
+Section~\ref{sec:issues} catalogues foreseeable implementation issues.
+Section~\ref{sec:effort} gives a difficulty and effort assessment.
+
+% ============================================================
+\section{Architecture}
+\label{sec:architecture}
+
+The reformed codebase has three clearly separated layers, each with a
+well-defined responsibility.
+
+\begin{center}
+\begin{tabular}{llp{7cm}}
+\toprule
+Layer & File & Owns \\
+\midrule
+Algorithm & \texttt{my\_algo.wl} & physics: energy, transition rule, coupling atoms, spatial dimension \\
+Orchestrator & \texttt{check.wls} & sweep strategy: which sizes and particle counts to test \\
+Core library & \texttt{dbc\_core.wl} & generic machinery: BFS, orbit computation, DB check \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+Nothing from the middle row should appear in the top row, and nothing
+algorithm-specific should be in the bottom two rows.  This is precisely what
+the current design violates: every algorithm file sets \texttt{\$nGrid},
+\texttt{\$particleTypes}, and \texttt{\$seedState}, and the core library
+hard-codes 2D position vectors throughout.
+
+The two documents that define the interface boundary are:
+\begin{itemize}
+  \item \texttt{algorithm\_requirements.md} --- the contract every algorithm
+    file must satisfy.
+  \item \texttt{template.wl} --- a minimal working algorithm file that a user
+    copies and fills in.
+\end{itemize}
+
+% ============================================================
+\section{Algorithm File Interface}
+\label{sec:interface}
+
+\subsection{Mandatory declarations}
+
+\paragraph{\texttt{\$AlgDim = D}.}
+The spatial dimension as a \textbf{hard-coded integer} --- the only
+non-symbolic, non-overridable value in the algorithm file.  It cannot be made
+symbolic because it determines the shape of all seed states, the structure of
+the translation group, and the form of the $\tau$-BFS offset.  For a pure 2D
+system \texttt{\$AlgDim = 2}; for a 2D position $+$ 2D momentum system, still
+\texttt{\$AlgDim = 2} (the spatial dimension).
+
+\paragraph{\texttt{\$particleTypeSet = \{$t_1, t_2, \ldots$\}}.}
+The set of distinct particle types the algorithm recognises.  The checker will
+generate all canonical type multisets from this set for each particle count
+tested.
+
+\paragraph{\texttt{Algorithm[state\_]}.}
+The MCMC transition rule.  Must use \texttt{\$nGrid} as a \emph{free variable}
+--- a symbol whose value is set by the checker before each run.  Must not
+hard-code any specific lattice size internally.
+
+\paragraph{\texttt{energy[state\_]}.}
+The bare energy (no $\beta$ factor), with the same free-variable convention for
+\texttt{\$nGrid}.
+
+\paragraph{\texttt{DynamicSymParams[states\_]}.}
+Returns the association of symbolic coupling atoms:
+\begin{lstlisting}
+<| "couplings" -> {couplingJ[1,2,1], couplingJ[1,2,2], ...},
+   "extraSymParams" -> {} |>
+\end{lstlisting}
+Called once per run with the current state set.
+
+\subsection{Optional declarations}
+
+\paragraph{\texttt{\$symmetryGroup}.}
+Defaults to \texttt{\{"translation"\}}.  The checker verifies any declared
+symmetry before exploiting it.
+
+\paragraph{\texttt{\$periodicDims}.}
+Which coordinate components have periodic boundary conditions.  Defaults to
+\texttt{Range[\$AlgDim]} (all spatial components).  For a phase-space system
+with 4D coordinates $\{x, y, v_x, v_y\}$, set
+\texttt{\$periodicDims = \{1, 2\}} so that only the spatial components receive
+the $\tau$-offset and modular normalisation.  This is the mechanism by which
+the framework generalises to phase-space algorithms without structural changes
+to the BFS engine.
+
+\paragraph{\texttt{\$velocitySet}.}
+For phase-space algorithms: the finite set of allowed velocity vectors,
+e.g.\ \texttt{\{\{-1,0\},\{1,0\},\{0,-1\},\{0,1\}\}}.  The checker uses this
+to enumerate the full phase-space site set $\{1,\ldots,n\}^{\texttt{\$AlgDim}}
+\times \texttt{\$velocitySet}$ when generating states.
+
+\paragraph{\texttt{numBeta}.}
+Inverse temperature for numerical mode only.
+
+\subsection{What must NOT appear}
+
+The algorithm file must \emph{not} set \texttt{\$nGrid} to a specific value,
+define \texttt{\$seedState}, or define \texttt{\$particleTypes}.  These are
+generated by the checker.
+
+\begin{warnbox}
+\textbf{Backward compatibility.} If the checker detects that the algorithm
+file sets \texttt{\$nGrid}, it runs in \emph{single-size mode}: the declared
+\texttt{\$nGrid}, \texttt{\$particleTypes}, and \texttt{\$seedState} are used
+as-is, and the sweep is skipped.  All existing algorithm files in the
+\texttt{examples/} directory work unchanged.
+\end{warnbox}
+
+\subsection{Minimal template}
+
+\begin{lstlisting}
+(* ==== template.wl -- minimal algorithm file ====
+   Copy this file and fill in the three required sections. *)
+
+$AlgDim         = 2;                   (* ONLY hard-coded value *)
+$particleTypeSet = {1, 2};             (* distinct particle types *)
+$symmetryGroup  = {"translation", "D4"};
+
+(* ---- Energy ---- *)
+energy[state_] := Module[{...},
+  (* Use $nGrid as a free variable for lattice size.
+     All spatial operations must use pairwise differences. *)
+  ...]
+
+(* ---- Algorithm ---- *)
+Algorithm[state_List] := Module[{n = $nGrid, ...},
+  (* One MCMC step. Call RandomReal[], RandomChoice[], etc. as needed.
+     Do NOT hard-code n = 3 or any specific lattice size. *)
+  ...]
+
+(* ---- Symbolic parameters ---- *)
+DynamicSymParams[states_List] :=
+  Module[{types, couplings},
+    types = Sort @ DeleteDuplicates @ Flatten[#[[2]] & /@ # & /@ states, 1];
+    couplings = Flatten @ Table[
+      couplingJ[a, b], {a, types}, {b, a, Max[types]}];
+    <| "couplings" -> couplings, "extraSymParams" -> {} |>]
+\end{lstlisting}
+
+% ============================================================
+\section{Automated Seed-State Sweep}
+\label{sec:sweep}
+
+\subsection{New command-line flags}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Flag & Meaning \\
+\midrule
+\texttt{-maxN N} & Maximum lattice side length (default 3) \\
+\texttt{-maxParticles K} & Maximum particles per seed state (default 4) \\
+\texttt{-allTypes} & Test all canonical type multisets (default: one per
+count) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Sweep structure}
+
+For each lattice side length $n = 1, 2, \ldots, \texttt{maxN}$:
+\begin{enumerate}
+  \item Compute the number of available sites:
+    $N_{\text{sites}} = n^{\texttt{\$AlgDim}} \times |\texttt{\$velocitySet}|$
+    (the $|\texttt{\$velocitySet}|$ factor is 1 for pure-position systems).
+  \item For each particle count $k = 0, 1, \ldots, \min(\texttt{maxParticles},
+    N_{\text{sites}})$:
+  \begin{enumerate}
+    \item Generate one or more canonical type multisets of size $k$ from
+      \texttt{\$particleTypeSet} (see below).
+    \item For each such multiset $T$: set \texttt{\$nGrid} $= n$,
+      \texttt{\$particleTypes} $= T$, generate the canonical seed state, and
+      run the full Steps~1--8 pipeline.
+    \item Record \texttt{PASS/FAIL} for the triple $(n, k, T)$.
+  \end{enumerate}
+\end{enumerate}
+After all runs: print an aggregated table; exit with code 0 if all passed,
+code 1 otherwise.
+
+\subsection{Canonical type multisets}
+
+Given particle count $k$ and type set $\{t_1, t_2, \ldots\}$, the default
+canonical multiset cycles through types in order:
+$T = (t_1, t_2, t_1, t_2, \ldots)$ truncated to length $k$.  For two types
+$\{1,2\}$ and $k = 5$: $T = (1, 2, 1, 2, 1)$.
+
+\begin{infobox}
+\textbf{Why this default matters.}  With $k$ particles cycling through all
+available types, every pair of distinct types appears in the system for even
+$k$.  This ensures that all coupling atoms $\texttt{couplingJ}[a,b,d^2]$ can
+appear in the transition probabilities, making the DB check sensitive to all
+coupling parameters.  The \texttt{-allTypes} flag generates every distinct
+multiset for thorough checking.
+\end{infobox}
+
+\subsection{Canonical seed state}
+
+Given lattice side length $n$, dimension $D$, and type multiset $T = (t_1,
+\ldots, t_k)$, the canonical seed state places particle $i$ at the $i$-th
+position in lexicographic order on $\{1,\ldots,n\}^D$:
+\begin{align*}
+  \text{seedState} &= \bigl\{ \{(1,1,\ldots,1),\, t_1\},\;
+                               \{(1,1,\ldots,2),\, t_2\},\; \ldots \bigr\}
+\end{align*}
+For a 2D lattice of side 3 with $T = (1, 2)$: seed $=\{((1,1),1),\;
+((1,2),2)\}$.  This is deterministic, dimension-agnostic, and independent of
+any physics.
+
+For phase-space systems, the seed also specifies initial velocities: each
+particle is assigned the first element of \texttt{\$velocitySet} (e.g.,
+$(-1,-1)$), giving the lexicographically first phase-space state.
+
+\subsection{Output format}
+
+The checker prints a table after completing all runs:
+
+\begin{lstlisting}
+n=1, k=0, T={}         : tau PASS  D4 --   Erg --   DB PASS
+n=1, k=1, T={1}        : tau PASS  D4 --   Erg PASS DB PASS
+n=2, k=0, T={}         : tau PASS  D4 PASS Erg --   DB PASS
+n=2, k=1, T={1}        : tau PASS  D4 PASS Erg PASS DB PASS
+n=2, k=2, T={1,2}      : tau PASS  D4 PASS Erg PASS DB PASS
+n=3, k=2, T={1,2}      : tau PASS  D4 PASS Erg PASS DB PASS
+n=3, k=3, T={1,2,1}    : tau PASS  D4 PASS Erg PASS DB PASS
+---
+OVERALL: PASS (7/7 configurations)
+\end{lstlisting}
+
+% ============================================================
+\section{\texorpdfstring{$D$}{D}-Dimensional Generalisation of the Core Library}
+\label{sec:ddim}
+
+\subsection{State format}
+
+The current format \texttt{\{\{row, col\}, type\}} is replaced by
+\texttt{\{\{$c_1, c_2, \ldots, c_{D_\text{total}}$\}, type\}} where
+$D_\text{total} = \texttt{\$AlgDim} + \texttt{\$MomDim}$.  For a pure 2D
+system $D_\text{total} = 2$; for a 2D spatial + 2D velocity system
+$D_\text{total} = 4$.
+
+This change is backwards-compatible: any function that currently indexes
+\texttt{state[[i,1,1]]} (row) and \texttt{state[[i,1,2]]} (column) continues
+to work for $D = 2$.  The internal functions must be generalised to loop over
+the coordinate vector.
+
+\subsection{State normalisation}
+
+\begin{lstlisting}
+(* Current (hardwired 2D) *)
+$dbcNormState[state_, nGrid_] :=
+  SortBy[Map[{{Mod[#[[1,1]]-1,nGrid]+1,
+               Mod[#[[1,2]]-1,nGrid]+1}, #[[2]]} &, state], First]
+
+(* Generalised: periodicDims specifies which components wrap *)
+$dbcNormState[state_, nGrid_, periodicDims_] :=
+  SortBy[Map[Function[p,
+    {MapIndexed[
+       If[MemberQ[periodicDims,#2[[1]]], Mod[#1-1,nGrid]+1, #1] &,
+       p[[1]]],
+     p[[2]]}], state], First]
+\end{lstlisting}
+
+The \texttt{periodicDims} parameter controls which coordinate components are
+wrapped by the modular arithmetic.  For pure position systems it equals
+\texttt{Range[AlgDim]}; for phase-space systems it is the subset
+\texttt{\{1,\ldots,AlgDim\}}.
+
+\subsection{\texorpdfstring{$\tau$}{Tau}-BFS in \texorpdfstring{$D$}{D} spatial dimensions}
+
+The translational invariance check adds symbolic offsets $\tau_1, \ldots,
+\tau_D$ to the spatial components of every position vector.  Generically, for
+spatial dimension $D$, the checker introduces $D$ symbols \texttt{\{$\tau_1$,
+\ldots, $\tau_D$\}} and augments only the periodic components:
+
+\begin{lstlisting}
+(* Generalised tau-augmentation *)
+$dbcAddTau[state_, alg_dim_] :=
+  Map[Function[p,
+    {MapIndexed[
+       If[#2[[1]] <= alg_dim, #1 + Symbol["tau"<>ToString[#2[[1]]]], #1] &,
+       p[[1]]],
+     p[[2]]}], state]
+\end{lstlisting}
+
+For a 2D system this recovers the current $\{\tau_r, \tau_c\}$ behaviour.  For
+a phase-space system with coordinates $\{x, y, v_x, v_y\}$ and
+\texttt{\$AlgDim = 2}, the augmented positions are $\{x + \tau_1, y + \tau_2,
+v_x, v_y\}$ --- velocity components are not shifted, correctly capturing that
+translational invariance is a property of position space alone.
+
+\subsection{Translation group in \texorpdfstring{$D$}{D} dimensions}
+
+The group of lattice translations $\mathbb{Z}_n^D$ is generated by all shifts
+$\mathbf{d} = (d_1, \ldots, d_D)$ with $d_i \in \{0, 1, \ldots, n-1\}$.
+Currently the group elements are enumerated by a 2D \texttt{Table} over
+\texttt{\{dr, dc\}}; the generalisation is a $D$-fold Cartesian product:
+
+\begin{lstlisting}
+(* Generalised translation elements *)
+translationElems[nGrid_, alg_dim_] :=
+  Map[<| "shift" -> # |> &,
+    Flatten[Outer[List, Sequence @@ Table[Range[0,nGrid-1], alg_dim]], alg_dim-1]]
+\end{lstlisting}
+
+The shift vectors act on the spatial components of position only; velocity
+components are unchanged.
+
+\subsection{Rotational symmetry}
+
+For $D = 2$: the D4 group (8 elements) is already implemented.  No change.
+
+For $D = 3$: the octahedral group $O_h$ has 48 elements.  These can be
+enumerated as the set of all $3\times3$ signed permutation matrices with
+determinant $+1$.  Adding Oh to the checker is a well-defined but non-trivial
+extension; it is deferred to a later phase.
+
+For phase-space systems ($D = 2$ spatial, $D = 2$ velocity): a D4 rotation by
+$90^\circ$ clockwise maps $(x, y) \to (y, n+1-x)$ in position space and
+simultaneously maps $(v_x, v_y) \to (v_y, -v_x)$ in velocity space.  This is
+a joint transformation on the full coordinate vector.  The symmetry element
+must encode both actions:
+
+\begin{lstlisting}
+(* D4 rotation for a 2D-position + 2D-velocity state *)
+$dbcPhaseSpaceD4Pos[1, x_, y_, vx_, vy_, n_] :=
+  {y, n+1-x, vy, -vx}   (* 90 degrees CW *)
+\end{lstlisting}
+
+For the initial implementation of phase-space systems, translation-only orbits
+are sufficient.  The coupled D4 action can be added in a later phase.
+
+\subsection{State enumeration}
+
+\begin{lstlisting}
+(* Current: 2D grid positions only *)
+$dbcEnumerateNParticleStates[seedState_, nGrid_] :=
+  Module[{types, allPos},
+    types  = Sort[#[[2]] & /@ seedState];
+    allPos = Flatten[Table[{r,c},{r,nGrid},{c,nGrid}],1];
+    ...]
+
+(* Generalised: D-dimensional grid, optional velocity set *)
+$dbcEnumerateNParticleStates[types_, nGrid_, alg_dim_, velocity_set_:{}] :=
+  Module[{posSites, sites, allAssignments},
+    posSites = Flatten[
+      Outer[List, Sequence @@ Table[Range[nGrid], alg_dim]],
+      alg_dim - 1];
+    sites = If[velocity_set === {},
+      posSites,
+      Flatten[Outer[Join, posSites, velocity_set, 1], 1]];
+    (* Enumerate all N-particle assignments on `sites` *)
+    ...]
+\end{lstlisting}
+
+For a 2D lattice of side $n$ with 4-direction velocities, this produces $4n^2$
+sites.  For $n = 2$ and $N = 2$ particles: $C(16, 2) = 120$ two-particle
+states (assuming particles are distinguishable by type).
+
+% ============================================================
+\section{Phase-Space Algorithms}
+\label{sec:phasespace}
+
+\subsection{Why phase-space matters}
+
+Most existing MCMC algorithms in statistical physics evolve only the positions
+of particles; velocities or momenta are integrated out analytically.  A richer
+class of algorithms, including stochastic lattice gases and kinetic Monte Carlo
+methods, maintains both positions and velocities as dynamical variables and
+samples from the full phase-space Boltzmann distribution
+\[
+  \pi(\mathbf{r}, \mathbf{v}) \propto
+    \exp\!\bigl(-\beta\, H(\mathbf{r}, \mathbf{v})\bigr), \qquad
+  H = \sum_i \tfrac{1}{2}|\mathbf{v}_i|^2 + \sum_{i<j} V(|\mathbf{r}_i -
+    \mathbf{r}_j|^2).
+\]
+Verifying detailed balance for these algorithms requires the checker to handle
+states with a velocity component, which the current design does not support.
+
+\subsection{State format for phase-space algorithms}
+
+Each particle is described by a four-component coordinate vector $\{x, y, v_x,
+v_y\}$ plus a type.  The full state is a sorted list of such pairs:
+\begin{lstlisting}
+{  {{1, 1, -1, 0}, 1},
+   {{2, 3,  0, 1}, 2},
+   ...  }
+\end{lstlisting}
+Sorting is by the full coordinate vector lexicographically: positions are
+primary, velocities are secondary.  This generalises the current sort without
+any conceptual change.
+
+The algorithm file declares:
+\begin{lstlisting}
+$AlgDim       = 2;               (* x, y are the two spatial dims *)
+$periodicDims = {1, 2};          (* only x, y are periodic *)
+$velocitySet  = {{-1,0},{1,0},{0,-1},{0,1}};  (* allowed velocities *)
+\end{lstlisting}
+
+\subsection{The streaming--collision problem}
+\label{sec:streamcol}
+
+The most physically natural algorithm for phase-space systems is
+streaming--collision dynamics:
+\begin{enumerate}
+  \item \textbf{Streaming}: each particle moves $\mathbf{r}_i \to \mathbf{r}_i
+    + \mathbf{v}_i$ (mod $n$).
+  \item \textbf{Collision}: at sites with multiple particles, redistribute
+    velocities stochastically.
+\end{enumerate}
+
+However, constructing a streaming--collision algorithm that satisfies detailed
+balance with the \emph{full} Hamiltonian $H = K + V$ is non-trivial.  The
+streaming step is deterministic and maps the system from one configuration to
+another with different potential energy $V(\mathbf{r} + \mathbf{v}) \neq
+V(\mathbf{r})$.  For the collision acceptance probability to restore detailed
+balance, it must account for \emph{both} the kinetic energy change $\Delta K$
+and the potential energy change $\Delta V$ induced by the preceding streaming.
+This couples the collision kernel to the global state in a way that makes the
+acceptance criterion complex and the DB verification non-trivial to design.
+
+Specifically, for the combined step to satisfy
+\[
+  T(\mathbf{s} \to \mathbf{s}')
+  \exp(-\beta H(\mathbf{s})) =
+  T(\mathbf{s}' \to \mathbf{s})
+  \exp(-\beta H(\mathbf{s}')),
+\]
+the collision acceptance ratio must equal
+$\exp(-\beta(H(\mathbf{s}') - H(\mathbf{s}))) = \exp(-\beta(\Delta K +
+\Delta V))$, where $\Delta V$ depends on the \emph{post-streaming} particle
+positions.  A collision kernel that uses only $\Delta K$ (the standard choice)
+satisfies detailed balance with respect to $K$ alone --- which is correct only
+when $V \equiv 0$ (non-interacting particles).
+
+This is a genuine theoretical constraint, not a limitation of the checker.  Any
+correct streaming--collision MCMC algorithm for interacting phase-space
+particles must either: (a) use a collision acceptance criterion that references
+the global potential energy, or (b) apply a separate global Metropolis
+correction step after streaming.  Implementing such an algorithm cleanly is
+deferred to a future extension.
+
+\subsection{Archetypal phase-space algorithm: position--velocity Metropolis}
+\label{sec:pvmetropolis}
+
+The clean, pedagogically correct first example is a \emph{position--velocity
+Metropolis} algorithm: two independent sub-moves, chosen at random, each of
+which satisfies detailed balance with respect to the full Hamiltonian $H = K +
+V$.
+
+\subsubsection*{Algorithm description}
+
+At each step:
+\begin{enumerate}
+  \item Choose a particle $p$ uniformly at random.
+  \item Draw $u \sim \mathrm{Uniform}[0,1]$.
+  \item \textbf{If $u < \tfrac{1}{2}$ (position move):}
+    \begin{enumerate}
+      \item Choose a displacement $\mathbf{d}$ uniformly from the set of
+        nearest-neighbour directions.
+      \item Proposed new position: $\mathbf{r}' = \mathbf{r}_p + \mathbf{d}$.
+      \item \emph{Hard-core rejection}: if any other particle already occupies
+        $\mathbf{r}'$ (regardless of its velocity), return the current state.
+      \item Compute $\Delta V = V_\text{new} - V_\text{old}$ (potential energy
+        change; velocity of $p$ is unchanged).
+      \item Accept with $\min(1, e^{-\beta \Delta V})$; else stay.
+    \end{enumerate}
+  \item \textbf{If $u \geq \tfrac{1}{2}$ (velocity move):}
+    \begin{enumerate}
+      \item Choose a new velocity $\mathbf{v}'$ uniformly from
+        \texttt{\$velocitySet}.
+      \item Compute $\Delta K = \tfrac{1}{2}(|\mathbf{v}'|^2 - |\mathbf{v}_p|^2)$.
+      \item Accept with $\min(1, e^{-\beta \Delta K})$; else stay.
+    \end{enumerate}
+\end{enumerate}
+
+\subsubsection*{Why this satisfies detailed balance}
+
+The position move satisfies DB with respect to $H$:
+\[
+  T_{\text{pos}}(\mathbf{s} \to \mathbf{s}')\, e^{-\beta H(\mathbf{s})} =
+  T_{\text{pos}}(\mathbf{s}' \to \mathbf{s})\, e^{-\beta H(\mathbf{s}')}.
+\]
+This holds because (i) the proposal is symmetric (same neighbour set forward
+and reverse), (ii) hard-core rejection is symmetric, and (iii) the Metropolis
+acceptance satisfies $\min(1, e^{-\beta \Delta V}) \cdot e^{-\beta K} =
+\min(1, e^{+\beta \Delta V}) \cdot e^{-\beta K} \cdot e^{-\beta \Delta V}$
+exactly.  Kinetic energy cancels because $\Delta K = 0$ for a position move.
+
+The velocity move satisfies DB with respect to $H$:
+\[
+  T_{\text{vel}}(\mathbf{s} \to \mathbf{s}')\, e^{-\beta H(\mathbf{s})} =
+  T_{\text{vel}}(\mathbf{s}' \to \mathbf{s})\, e^{-\beta H(\mathbf{s}')}.
+\]
+This holds because the velocity proposal is symmetric over
+\texttt{\$velocitySet}, potential energy cancels ($\Delta V = 0$ for a velocity
+move), and Metropolis on $\Delta K$ satisfies the condition exactly.
+
+A 50/50 random mixture of two Markov kernels that both satisfy DB with respect
+to the same stationary distribution $\pi$ is itself DB-satisfying with respect
+to $\pi$.  Therefore the full algorithm satisfies detailed balance with respect
+to $\pi \propto \exp(-\beta H)$.
+
+\subsubsection*{Algorithm file sketch}
+
+\begin{lstlisting}
+(* ==== phase_space_metropolis.wl ====
+   2D spatial + 2D velocity Metropolis.
+   State: {{{x, y, vx, vy}, type}, ...}
+   H = sum_i (vx_i^2 + vy_i^2)/2 + sum_{i<j} couplingJ[ta,tb,|ri-rj|^2] *)
+
+$AlgDim        = 2;
+$periodicDims  = {1, 2};
+$velocitySet   = {{-1,0},{1,0},{0,-1},{0,1}};
+$particleTypeSet = {1, 2};
+$maxD2         = 2;
+
+$posDisps = {{-1,0},{1,0},{0,-1},{0,1}};
+
+(* Potential energy: pairwise, depends on spatial positions only *)
+$potE[state_, n_] := Module[{total = 0},
+  Do[
+    With[{d2 = $pairD2Spatial[state[[i,1]], state[[j,1]], n]},
+      If[0 < d2 <= $maxD2,
+        total += couplingJ[state[[i,2]], state[[j,2]], d2]]],
+    {i, Length[state]}, {j, i+1, Length[state]}]; total]
+
+$pairD2Spatial[p1_, p2_, n_] :=
+  With[{dr = p1[[1]]-p2[[1]], dc = p1[[2]]-p2[[2]]},
+    With[{dra = Mod[Abs[dr],n], dca = Mod[Abs[dc],n]},
+      Min[dra,n-dra]^2 + Min[dca,n-dca]^2]]
+
+(* Kinetic energy: sum of |v|^2 / 2 per particle *)
+$kinE[state_] := Total[(#[[1,3]]^2 + #[[1,4]]^2)/2 & /@ state]
+
+energy[state_] := $kinE[state] + $potE[state, $nGrid]
+
+Algorithm[state_List] :=
+  Module[{n = $nGrid, p, x, y, vx, vy, tp, rest, u},
+    If[state === {}, Return[state]];
+    p  = RandomChoice[state];
+    x  = p[[1,1]]; y  = p[[1,2]];
+    vx = p[[1,3]]; vy = p[[1,4]];
+    tp = p[[2]];
+    rest = DeleteCases[state, p, 1];
+    u = RandomReal[];
+
+    If[u < 1/2,
+      (* --- Position move --- *)
+      With[{d = RandomChoice[$posDisps],
+            newXY = {x,y} + RandomChoice[$posDisps]},
+        (* hard-core: no other particle at newXY regardless of velocity *)
+        If[AnyTrue[rest, Function[q,
+              Mod[q[[1,1]]-newXY[[1]],n]===0 &&
+              Mod[q[[1,2]]-newXY[[2]],n]===0]],
+           Return[state]];
+        With[{ns = SortBy[Append[rest,
+                    {{newXY[[1]],newXY[[2]],vx,vy},tp}], First]},
+          With[{dV = $potE[ns,n] - $potE[state,n]},
+            If[RandomReal[] < Piecewise[{{1,dV<=0}},Exp[-\[Beta]*dV]],
+               ns, state]]]],
+
+      (* --- Velocity move --- *)
+      With[{nv = RandomChoice[$velocitySet]},
+        With[{dK = (nv[[1]]^2+nv[[2]]^2 - vx^2-vy^2)/2},
+          With[{ns = SortBy[Append[rest,{{x,y,nv[[1]],nv[[2]]},tp}],First]},
+            If[RandomReal[] < Piecewise[{{1,dK<=0}},Exp[-\[Beta]*dK]],
+               ns, state]]]]]]
+
+DynamicSymParams[states_List] :=
+  Module[{types, n, d2Vals, atoms},
+    types  = Sort @ DeleteDuplicates @ Flatten[#[[2]] & /@ # & /@ states, 1];
+    n      = $nGrid;
+    d2Vals = Sort @ DeleteDuplicates @ Select[
+      Flatten @ Table[Min[dr,n-dr]^2+Min[dc,n-dc]^2,
+        {dr,0,Floor[n/2]},{dc,0,Floor[n/2]}],
+      0 < # <= $maxD2 &];
+    atoms = Flatten @ Table[
+      If[a<=b, Table[couplingJ[a,b,d2],{d2,d2Vals}], Nothing],
+      {a,types},{b,types}];
+    <| "couplings" -> atoms, "extraSymParams" -> {} |>]
+\end{lstlisting}
+
+\subsubsection*{What the checker will verify}
+
+When run with \texttt{-maxN 2 -maxParticles 2}, the checker will test:
+\begin{itemize}
+  \item $n=1$, $k=0$: trivially empty state.
+  \item $n=1$, $k=1$: one particle on a single site; only velocity moves are
+    possible.  The checker verifies DB for all velocity pairs $\{v, v'\}$ and
+    all coupling values.
+  \item $n=2$, $k=1$: one particle on a $2\times2$ torus.  Position moves and
+    velocity moves both active.
+  \item $n=2$, $k=2$, $T=\{1,2\}$: two particles on a $2\times2$ torus with 4
+    velocities each.  State space has $C(16, 2) = 120$ states.  The DB check
+    exercises all coupling atoms $\texttt{couplingJ}[1, 2, d^2]$ and verifies
+    that the kinetic acceptance is correctly applied.
+\end{itemize}
+
+A broken variant (e.g., using $\beta/2$ in the velocity acceptance criterion)
+will produce DB violations at the $k=1$ level where only velocity moves
+operate, making the failure immediately legible.
+
+% ============================================================
+\section{Foreseeable Issues}
+\label{sec:issues}
+
+\subsection{Lazy evaluation of grid-dependent globals}
+Several existing algorithm files compute geometry helpers at load time using
+the then-current value of \texttt{\$nGrid}:
+\begin{lstlisting}
+$nStep       = Max[1, Round[physLen]];   (* vmmc_2d.wl *)
+$smDisps     = DeleteCases[Flatten[...], {0,0}];  (* single_metropolis.wl *)
+\end{lstlisting}
+These are evaluated once when the file is \texttt{Get[]}'d and then cached as
+global constants.  Under the sweep design, \texttt{\$nGrid} changes between
+runs, so any helper that depends on \texttt{\$nGrid} and is computed at load
+time will silently use a stale value.  The fix is to compute such helpers
+lazily inside \texttt{Algorithm[]} or \texttt{energy[]} using the local
+\texttt{n = \$nGrid} binding:
+\begin{lstlisting}
+Algorithm[state_List] := Module[{n = $nGrid,
+    disps = DeleteCases[Flatten[Table[{dx,dy},{dx,-1,1},{dy,-1,1}],1],{0,0}],
+    ...}, ...]
+\end{lstlisting}
+For the existing examples, inspection shows that the precomputed globals are
+all independent of \texttt{\$nGrid} (e.g., \texttt{\$smDisps} is the fixed
+list of 8 unit displacements).  The sweep design is therefore backward
+compatible for these files without modification.
+
+\subsection{EBE cost across many system sizes}
+The EBE Phase~2 (hyperplane arrangement BFS via
+\texttt{FindInstance}) runs once per $(n, T)$ combination.  A sweep of
+\texttt{-maxN 3 -maxParticles 4} with two types produces roughly 20
+independent check runs.  Phase~2 is fast for small systems but the aggregate
+cost grows.  The existing chamber-reuse mechanism (D4 EBE chambers reused for
+DB EBE) already eliminates duplicate Phase~2 work within a single $(n, T)$
+run.  Cross-size reuse is not straightforward since the coupling atom set
+changes with particle types.  The recommended mitigation is to fail fast: if
+any $(n, T)$ run finds a DB violation, the sweep stops at that point.
+
+\subsection{Phase-space state space growth}
+Including velocity degrees of freedom multiplies the state space by
+$|\texttt{\$velocitySet}|$ per particle.  For a $2 \times 2$ lattice with
+4-direction velocities and 2 particles the state space is approximately
+$120$, compared to $12$ for the pure-position case.  For $n = 3$ with 8
+velocities and 3 particles the state space reaches several thousand.  For
+phase-space systems the default \texttt{-maxN} should be 2, and the template
+file should carry a comment recommending this.
+
+\subsection{\texorpdfstring{$\tau$}{Tau}-BFS with four-dimensional coordinates}
+For a state with coordinate vector $\{x, y, v_x, v_y\}$, the
+\texttt{\$dbcAddTau} function must add $\tau_1$ to $x$ and $\tau_2$ to $y$
+only.  If the \texttt{\$periodicDims} parameter is not passed through correctly
+to all three $\tau$-related functions (\texttt{\$dbcAddTau},
+\texttt{\$dbcNormTauState}, and the norm function passed to
+\texttt{\$dbcBuildStateLeaves}), the $\tau$ symbols will either leak into the
+velocity components (causing a spurious $\tau$-FAIL) or fail to cancel in the
+spatial components (also a spurious FAIL).  Careful parameter threading is
+required.
+
+\subsection{Hard-core constraint for phase-space systems}
+There are two natural hard-core conventions: (a) no two particles at the same
+\emph{position}, regardless of velocity, and (b) no two particles at the same
+\emph{phase-space point} $\{x, y, v_x, v_y\}$.  Convention (a) is physically
+appropriate for particles with a finite size; convention (b) models a fermionic
+exclusion principle.  These lead to different state enumerations and different
+transition probabilities.  The algorithm file must make this choice explicit,
+and the checker's state enumeration must respect it.  For the canonical example
+(\S\ref{sec:pvmetropolis}) convention (a) is used because the position move
+checks for occupancy based on position only.
+
+\subsection{Coupling atoms with kinetic energy}
+For a phase-space system the energy is $H = K + V$.  The kinetic part $K =
+\sum_i |\mathbf{v}_i|^2/2$ uses the \emph{velocity values as data} from the
+state, not as symbolic parameters.  The coupling atoms returned by
+\texttt{DynamicSymParams} are therefore only the potential couplings
+$\{\texttt{couplingJ}[a, b, d^2]\}$; the factor $1/2$ in $K$ is a fixed
+rational.  This means \texttt{\$dbcIsExpZero} will encounter terms with both
+rational exponents (from kinetic contributions) and symbolic exponents (from
+potential contributions).  Fortunately \texttt{\$dbcIsExpZero} already handles
+this: it groups terms by exponent class, and rational exponents form their own
+class.  No changes to the DB check are needed.
+
+% ============================================================
+\section{Effort and Difficulty Assessment}
+\label{sec:effort}
+
+\begin{center}
+\begin{tabular}{p{6.5cm}lp{4.5cm}}
+\toprule
+Task & Difficulty & Notes \\
+\midrule
+\texttt{algorithm\_requirements.md} + \texttt{template.wl} & Low &
+  Documentation only \\
+Backward-compat detection in \texttt{check.wls} & Low &
+  Detect \texttt{\$nGrid} assignment \\
+Multi-size sweep loop in \texttt{check.wls} & Medium &
+  Nested loop; output table \\
+Canonical type-multiset and seed-state generation & Medium &
+  Deterministic, dimension-agnostic \\
+$D$-dim state normalisation in \texttt{dbc\_core.wl} & Medium &
+  Pervasive; thread \texttt{periodicDims} \\
+$D$-dim translation group elements & Low-Medium &
+  $D$-fold Cartesian product \\
+$D$-dim orbit computation & Medium &
+  Only positional indexing changes \\
+$\tau$-BFS with \texttt{periodicDims} & Medium &
+  Thread param into three functions \\
+Phase-space state enumeration & Medium &
+  Extend to velocity-set sites \\
+\texttt{phase\_space\_metropolis.wl} example & Medium &
+  Position and velocity moves clean \\
+Coupled D4 on position+velocity & Hard &
+  Defer to later phase \\
+Streaming--collision MCMC & Hard &
+  Non-trivial acceptance; defer \\
+Adapt existing examples & Low &
+  Remove 3 lines per file \\
+Full regression testing & Medium &
+  Verify sweep matches current output \\
+\midrule
+\textbf{Estimate (staged)} & & Core: 1--2 wks; phase-space example: 3--5 days \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+The recommended implementation order is:
+\begin{enumerate}
+  \item Write \texttt{algorithm\_requirements.md} and \texttt{template.wl}
+    (establishes the interface contract before any code changes).
+  \item Generalise \texttt{dbc\_core.wl} to $D$ dimensions with
+    \texttt{periodicDims} (enables all subsequent work).
+  \item Add the multi-size sweep to \texttt{check.wls} with backward-compat
+    mode.
+  \item Adapt existing examples and run regression tests.
+  \item Implement \texttt{phase\_space\_metropolis.wl} and test on $n=2$.
+  \item Add coupled D4 action and streaming--collision example (later phases).
+\end{enumerate}
+
+% ============================================================
+\section{Summary}
+
+The principal architectural change is a clean separation of \emph{physics}
+(algorithm file) from \emph{infrastructure} (checker and core library).  An
+algorithm file in the new design declares only three physical items: the spatial
+dimension \texttt{\$AlgDim}, the particle type set \texttt{\$particleTypeSet},
+and the three functions \texttt{Algorithm}, \texttt{energy}, and
+\texttt{DynamicSymParams}.  Everything else --- lattice size, seed state,
+particle count sweep --- is generated and controlled by the checker.
+
+The $D$-dimensional generalisation of the core library is largely mechanical:
+every function that currently indexes a 2-component position vector must be
+updated to loop over the \texttt{periodicDims} parameter.  The BFS engine and
+the DB checking machinery require no changes.
+
+Phase-space algorithms are accommodated naturally within this framework by
+treating velocity as additional (non-periodic) coordinate components.  The
+archetypal example --- a position+velocity Metropolis algorithm with separate
+sub-moves --- is theoretically clean, straightforward to implement, and a
+valuable demonstration that the checker correctly handles a Hamiltonian with
+both kinetic and potential terms.  The more complex streaming+collision case is
+deferred because constructing a DB-correct streaming+collision algorithm for
+\emph{interacting} particles requires an acceptance criterion that accounts for
+potential energy changes due to streaming, making it a non-trivial algorithm
+design problem in its own right.
+
+\end{document}

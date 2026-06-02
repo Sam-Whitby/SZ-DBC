@@ -47,6 +47,8 @@ maxDepth   = ToExpression[parseOpt["-maxDepth",  "22"]];
 timeLimit  = ToExpression[parseOpt["-timeLimit", "120"]];
 ebeMaxK    = ToExpression[parseOpt["-ebeMaxK",   "10000"]];
 verbose    = parseBool["-verbose"];
+useJulia   = parseBool["-julia"];
+juliaScript = FileNameJoin[{DirectoryName[$InputFileName], "julia_poc", "phase3.jl"}];
 
 
 (* ---- Load core library ---- *)
@@ -388,15 +390,26 @@ If[mode === "SZPure",
      Falls back to probabilistic SZ when k > ebeMaxK.
      If D4 EBE ran (d4Result["ebe"]==True), reuse its feasible
      regions to skip the expensive Phase 2 chamber enumeration.   *)
-  violations = $dbcEBECheckLeaves[
-    repLeaves, repToOrbitMap,
-    Function[st, Block[{$nGrid=nGrid}, energy[st]]],
-    allStates, nGrid, symParamList,
-    ebeMaxK, szRepeats, 1*^-7,
-    If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
-       rotCheck["chambers"], {}],
-    If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
-       rotCheck["conds"], {}]]]];
+  violations = If[useJulia,
+    $dbcEBECheckLeavesJulia[
+      repLeaves, repToOrbitMap,
+      Function[st, Block[{$nGrid=nGrid}, energy[st]]],
+      allStates, nGrid, symParamList,
+      ebeMaxK, szRepeats, 1*^-7,
+      If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
+         rotCheck["chambers"], {}],
+      If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
+         rotCheck["conds"], {}],
+      juliaScript],
+    $dbcEBECheckLeaves[
+      repLeaves, repToOrbitMap,
+      Function[st, Block[{$nGrid=nGrid}, energy[st]]],
+      allStates, nGrid, symParamList,
+      ebeMaxK, szRepeats, 1*^-7,
+      If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
+         rotCheck["chambers"], {}],
+      If[TrueQ[d4Result["d4Pass"]] && TrueQ[rotCheck["ebe"]],
+         rotCheck["conds"], {}]]]]];
 If[MatchQ[violations, $dbc$cantHandle[_]],
   Print["  ERROR: ", violations[[1]]]; Exit[1]];
 

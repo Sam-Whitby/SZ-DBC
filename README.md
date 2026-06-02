@@ -154,6 +154,8 @@ wolframscript -file check.wls <algorithm.wl> [options]
   -maxDepth N           BFS bit depth limit (default 22)
   -timeLimit T          Per-state time limit in seconds (default 120)
   -verbose              Print per-rep BFS progress
+  -julia                Experimental: delegate Phase 3 Step C to Julia subprocess
+                        (see Julia performance note below; currently slower, not recommended)
 ```
 
 ---
@@ -191,5 +193,7 @@ algebraic verification.
 **NormalDistribution is discretised.** The checker models `RandomVariate[NormalDistribution[mu, sigma]]` as a discrete distribution on `Floor[nGrid/2]` integers around `mu`. For symmetric proposals (`mu=0`) this does not affect PASS/FAIL classification (the truncated Gaussian is also symmetric). For large `sigma` relative to `nGrid/2`, a warning is printed.
 
 **Open-chamber boundary omission.** The EBE check covers all open chambers of the hyperplane arrangement. Boundaries where two or more conditions are simultaneously tight (e.g., `J1 = J2` exactly) are not tested. For standard Metropolis algorithms (transition probabilities continuous in coupling constants), any violation in a positive-measure region must appear in an adjacent open chamber, so this omission is harmless in practice.
+
+**Julia Phase 3 (`-julia`) is currently slower, not faster.** A Julia implementation of EBE Phase 3 (Step C) was benchmarked: Julia's compiled rational arithmetic is ~35× faster than Mathematica's interpreted pair loop (2.6s vs 93s for vmmc_2d's 512 regions × 5688 pairs). However, the data pipeline (converting 4368 leaf weights per region to Julia-compatible integer arrays, writing ~180MB of JSON, Julia startup time) costs more than it saves. Full measurements: vmmc_2d 217s → 305s (1.4× slower), single_metropolis 45s → 67s (1.5× slower). The flag is provided for research purposes. True speedup would require moving EBE Phase 2 data preparation to Julia as well, which necessitates exporting the leaf weight Piecewise structure from Mathematica in a Julia-evaluable form — a non-trivial engineering task.
 
 **BFS timeout aborts the run.** If a BFS path exceeds the per-state time limit (`-timeLimit`), the checker aborts with an error. Increase `-timeLimit` if needed.
