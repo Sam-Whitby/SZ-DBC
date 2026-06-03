@@ -79,13 +79,13 @@ The leaf weights are symbolic expressions in the coupling parameters. The Piecew
 
 #### Julia acceleration (optional)
 
-When the `-julia` flag is used, EBE exports a **compact representation** of Phase 1 (Piecewise condition indices + rational coefficient vectors) and delegates Phase 2 (chamber enumeration) and Phase 3 (DB check) to a Julia subprocess:
+When the `-julia` flag is used, EBE uses a two-phase approach:
 
-**Phase 2 (Julia)**: Uses CDDLib's exact rational arithmetic to enumerate all feasible coupling-constant chambers via sign-pattern BFS, using strictly interior rational points for J*evaluation.
+**Phase 2 (Mathematica)**: A non-strict BFS enumerates all sigma patterns (coupling-parameter sign patterns) where the Piecewise conditions have a definite True/False assignment. The non-strict negation (`>=` for False conditions) bridges disconnected octants of the hyperplane arrangement, ensuring all genuine open chambers are found. After BFS, degenerate boundary patterns — those lying on a measure-zero hyperplane where a pair of contradictory conditions are simultaneously at their shared boundary — are filtered out algebraically. For strict conditions (Less/Greater), degeneracy occurs when both are False; for non-strict conditions (LessEqual/GreaterEqual), when both are True.
 
-**Phase 3 (Julia)**: For each chamber, evaluates leaf weights from the compact structure (dot products with J*) and checks the Boltzmann-exponent grouped DB residual = 0 using exact rational arithmetic.
+**Phase 3 (Julia)**: For each genuine chamber, evaluates leaf weights from the compact structure using sigma-substitution (True/False directly into Piecewise expressions, no PiecewiseExpand), groups DB terms by integer exponent coefficient vector, and checks that each group sums to zero using exact `Rational{Int64}` arithmetic. No BigInt and no specific J* evaluation point needed — grouping by integer coefficient vector is algebraically exact and equivalent to Mathematica's symbolic exponent grouping.
 
-**Fallback**: If the compact export fails (e.g., for highly nested Piecewise structures), the checker automatically falls back to the pure-Mathematica EBE path and produces identical results.
+**Fallback**: If the compact export fails (e.g., leaf weights contain non-standard β factors), the checker automatically falls back to the pure-Mathematica EBE path.
 
 ---
 
@@ -158,27 +158,27 @@ wolframscript -file check.wls <algorithm.wl> [options]
   -maxDepth N           BFS bit depth limit (default 22)
   -timeLimit T          Per-state time limit in seconds (default 120)
   -verbose              Print per-rep BFS progress
-  -julia                Experimental: delegate Phase 2+3 to Julia subprocess
-                        (requires CDDLib and Polyhedra packages; falls back to Mathematica if export fails)
+  -julia                Delegate Phase 3 to Julia subprocess (faster for algorithms
+                        with many Piecewise conditions); falls back to Mathematica if export fails
 ```
 
 ---
 
 ## Provided examples
 
-| File | Expected result | Time (default, no -julia) |
-|---|---|---|
-| `single_metropolis.wl` | τ PASS, DB PASS | ~35s |
-| `kawasaki.wl` | τ PASS, DB PASS, Ergodicity FAIL (by design) | ~3s |
-| `vmmc_2d.wl` | τ PASS, DB PASS | ~190s |
-| `quadratic_field.wl` | τ FAIL (absolute-position energy), DB PASS | ~5s |
-| `broken_variable_pool.wl` | DB FAIL — asymmetric pool size (3 or 4) | <5s |
-| `broken_8way_hop.wl` | DB FAIL — asymmetric pool size (7 or 8) | <5s |
-| `broken_biased_direction.wl` | DB FAIL — duplicate direction in proposal pool | <5s |
-| `broken_metropolis_halfbeta.wl` | DB FAIL — accept probability uses β/2 instead of β | <5s |
-| `broken_field_wrong_accept.wl` | DB FAIL — accept uses pair energy only, ignores field | <5s |
+| File | Expected result | Time (no -julia) | Time (-julia) |
+|---|---|---|---|
+| `single_metropolis.wl` | τ PASS, DB PASS | ~35s | ~20s |
+| `kawasaki.wl` | τ PASS, DB PASS, Ergodicity FAIL (by design) | ~3s | ~3s |
+| `vmmc_2d.wl` | τ PASS, DB PASS | ~226s | ~33s |
+| `quadratic_field.wl` | τ FAIL (absolute-position energy), DB PASS | ~5s | ~5s |
+| `broken_variable_pool.wl` | DB FAIL — asymmetric pool size (3 or 4) | <5s | <5s |
+| `broken_8way_hop.wl` | DB FAIL — asymmetric pool size (7 or 8) | <5s | <5s |
+| `broken_biased_direction.wl` | DB FAIL — duplicate direction in proposal pool | <5s | ~15s |
+| `broken_metropolis_halfbeta.wl` | DB FAIL — accept probability uses β/2 instead of β | <5s | <5s (fallback) |
+| `broken_field_wrong_accept.wl` | DB FAIL — accept uses pair energy only, ignores field | <5s | <5s |
 
-The `vmmc_2d.wl` runtime of ~190s is dominated by EBE Phase 3: VMMC's cluster-building logic generates k=12 nearly independent Piecewise conditions, producing 512 feasible coupling-constant chambers. Each chamber requires checking 5,688 communicating state pairs. This scales as O(chambers × pairs) and is the fundamental cost of an exact algebraic verification.
+The `vmmc_2d.wl` runtime is dominated by EBE Phase 3 in the default path: VMMC's cluster-building logic generates k=12 Piecewise conditions, producing 216 genuine open chambers (the non-strict Phase 2 BFS visits 2048 sign patterns and finds 512, of which 296 are degenerate boundary patterns that are filtered). Each of the 216 chambers requires checking 5,688 communicating state pairs. The `-julia` flag reduces EBE time from ~205s to ~15s via Julia's integer-coefficient-vector DB check (7× overall speedup on this example).
 
 ---
 
@@ -194,7 +194,7 @@ The `vmmc_2d.wl` runtime of ~190s is dominated by EBE Phase 3: VMMC's cluster-bu
 
 **Open-chamber boundary omission.** The EBE check covers all open chambers of the hyperplane arrangement. Boundaries where two or more conditions are simultaneously tight (e.g., `J1 = J2` exactly) are not tested. For standard Metropolis algorithms (transition probabilities continuous in coupling constants), any violation in a positive-measure region must appear in an adjacent open chamber, so this omission is harmless in practice.
 
-**Julia Phase 2+3 (`-julia`)**: When enabled, the checker exports a compact Piecewise structure and delegates chamber enumeration and DB checking to Julia using CDDLib and Polyhedra. Simpler algorithms (k < 12) run ~2–4× faster; for vmmc_2d (k=12, 512 chambers), Julia's startup and export overhead dominates, so the default Mathematica path is typically faster. The flag is provided for research and future optimization — as Mathematica's performance improves or Julia startup cost decreases, this may become the default. The fallback to Mathematica ensures correctness is never compromised.
+**`-julia` flag**: When enabled, Mathematica runs Phase 2 (non-strict BFS + degenerate filter, same FindInstance cost as the default path), then delegates Phase 3 to a Julia subprocess. Julia groups DB terms by integer exponent coefficient vector using exact `Rational{Int64}` arithmetic — 200–300× faster than Mathematica's symbolic Phase 3 for algorithms with many chambers. For vmmc_2d (216 genuine chambers), `-julia` reduces total runtime from ~226s to ~33s. Fallback to Mathematica if the compact export fails (e.g., non-standard β factors in weights).
 
 **BFS timeout aborts the run.** If a BFS path exceeds the per-state time limit (`-timeLimit`), the checker aborts with an error. Increase `-timeLimit` if needed.
 
@@ -206,20 +206,29 @@ The `vmmc_2d.wl` runtime of ~190s is dominated by EBE Phase 3: VMMC's cluster-bu
 
 - **Removed D4 from default `$symmetryGroup`**: D4 verification costs 2× the DB check but saves <10% on Phase 3, making it net negative for large chamber counts. Users who need D4 verification can add it explicitly; the algebraic check remains available.
 - **τ-BFS now captures leaves**: Setting τ=0 in τ-BFS leaves produces identical BFS output, eliminating the separate BFS pass and saving ~13s on typical algorithms (10–35s faster overall).
-- **Julia Phase 2+3 (optional)**: Compact Piecewise structure export avoids the ~100s per-leaf conversion overhead of the old approach. CDDLib provides 7× faster chamber enumeration than Mathematica's FindInstance-based BFS. For simple algorithms, this is a net speedup; for highly nested Piecewise structures (vmmc_2d), export fails gracefully and falls back to Mathematica.
+- **Julia Phase 3 (optional, `-julia`)**: Phase 3 (the expensive per-chamber DB check) is delegated to Julia. Phase 2 remains in Mathematica using a non-strict BFS that correctly bridges all octants of the hyperplane arrangement. The compact structure uses sigma-substitution (True/False directly into Piecewise) rather than PiecewiseExpand, avoiding unmatched condition expressions. Julia groups DB terms by integer coefficient vector (algebraically exact, no BigInt) for a 200–300× speedup on Phase 3.
+
+### Correctness of Phase 2: non-strict BFS + degenerate filter
+
+The Phase 2 BFS uses non-strict negation (`>=` for False conditions) so that degenerate boundary patterns — lying on measure-zero hyperplane boundaries — are visited and serve as bridges between disconnected octants of the arrangement. After BFS, these patterns are filtered out algebraically:
+
+- **Strict pairs** (Less/Greater conditions): degenerate when both conditions are False (boundary `expr = 0` between `expr < 0` and `expr > 0`)
+- **Non-strict pairs** (LessEqual/GreaterEqual conditions): degenerate when both conditions are True (boundary `expr = 0` shared by `expr ≤ 0` and `expr ≥ 0`)
+
+Using strict negation (the v1 approach) for Phase 2 BFS disconnects the graph at contradictory-pair boundaries, causing the BFS to miss 7/8 of the coupling-parameter space for algorithms with 3 such pairs. The non-strict approach is complete: for vmmc_2d it finds all 216 genuine open chambers (versus 512 BFS-feasible patterns minus 296 degenerate ones).
 
 ### Bottleneck hierarchy (vmmc_2d as example, time per phase)
 
-| Phase | Time | Driver | Optimized? |
+| Phase | Time (no -julia) | Time (-julia) | Driver |
 |---|---|---|---|
-| τ-BFS | ~13s | Symbolic bit-reader on 56 reps | ✓ (optimal, already in Mathematica) |
-| Ergodicity | ~2s | Graph BFS from 504-state transition graph | ✓ (negligible) |
-| EBE Phase 2 (Julia) | ~7s | CDDLib chamber BFS, 2048 patterns checked | ✓ (7× faster than Mathematica) |
-| EBE Phase 3 (Julia) | ~0.5s | Compiled rational arithmetic, 512 regions × 5688 pairs | ✓ (35× faster than Mathematica) |
-| EBE Phase 1+2 (Mathematica fallback) | ~5s | FindInstance BFS on 512 regions | ✓ (acceptable, only if export fails) |
-| **Total** | **~190–210s** | Mathematica floor + Julia acceleration | At capacity |
+| τ-BFS | ~16s | ~16s | Symbolic bit-reader on 56 reps |
+| Ergodicity | ~2s | ~2s | Graph BFS on 504-state transition graph |
+| EBE Phase 2 (Mathematica BFS) | ~10s | ~10s | FindInstance BFS, 2048 patterns → 216 genuine |
+| EBE Phase 3 | ~195s | ~0.7s | Mathematica symbolic vs Julia integer-key |
+| Export + Julia startup | — | ~2.5s | JSON write + Julia JIT (JSON3 only) |
+| **Total** | **~226s** | **~33s** | **7× speedup** |
 
-The Mathematica floor (τ-BFS + ergodicity) is ~15s and cannot be reduced further without reimplementing the BFS engine in Julia with Cassette.jl (not done due to API instability and marginal overall gain).
+The Mathematica floor (τ-BFS + ergodicity + Phase 2) is ~28s. Phase 3 is the only phase where Julia provides a speedup.
 
 ---
 
@@ -233,7 +242,7 @@ wolframscript -file check.wls examples/single_metropolis.wl -verbose
 
 This prints indices and timing for each orbit representative's BFS, helping identify which states are expensive.
 
-For Julia-mode debugging, check the stderr output of the Julia subprocess in the ebe.jl Phase 2 output (printed by the Mathematica driver).
+For Julia-mode debugging, check the stderr output printed by Mathematica: `EBE: N feasible region(s)` shows the BFS result, `EBE: M genuine open chamber(s)` shows the count after degenerate filtering, and `Julia compact export:` shows the export timing. Julia's own stderr (Load/Phase 3 timing) is printed inline.
 
 ---
 

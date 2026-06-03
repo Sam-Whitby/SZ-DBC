@@ -1,43 +1,50 @@
 """
-SZ-DBC Phase 2 + Phase 3 in Julia — compact structure approach.
+SZ-DBC Phase 3 in Julia — compact structure approach.
 
 Usage: julia --project=<dir> ebe.jl <compact_in.json> <output.json>
 
-Mathematica exports a compact Phase-1 structure (Piecewise condition
-indices + coefficient vectors) for each unique leaf weight.  This script:
+Mathematica runs Phase 1 (condition extraction) and Phase 2 (non-strict BFS +
+degenerate filter), exports a compact structure with:
+  - 'feasible_sigmas': the genuine open chambers found by Phase 2
+  - per-unique-weight compact Piecewise structure (sigma-substitution)
 
-  Phase 2 — Chamber enumeration via CDDLib BFS (exact rational LP)
-             Finds all feasible coupling-constant chambers by BFS over
-             sign patterns, using CDDLib for strict-interior-point queries.
+This script runs Phase 3 only: for each sigma pattern, pre-computes active
+Boltzmann terms, groups them by integer exponent coefficient vector, and checks
+that the DB residual is exactly zero for every communicating state pair.
 
-  Phase 3 — Exact DB check using compact evaluation
-             For each chamber and each communicating pair, evaluates leaf
-             weights from the compact structure (dot products with jStar)
-             and checks the Boltzmann-exponent grouped DB residual = 0.
+Correctness:
+  Grouping by integer coefficient vector (v_coeffs + energy_coeffs[state]) is
+  algebraically exact: two terms cancel iff their combined exponent function
+  dot(v, J) is identical for ALL J, which happens iff the integer vectors are
+  equal.  This is equivalent to Mathematica's \$dbcIsExpZero grouping and does
+  not require evaluating at any specific J*.
 
-Both phases are fully deterministic: all arithmetic is exact rational (BigInt).
+  The 'feasible_sigmas' from Mathematica's Phase 2 cover all genuine open
+  chambers of the hyperplane arrangement.  Phase 2 uses a non-strict BFS that
+  bridges disconnected octants through degenerate boundary patterns, then filters
+  those patterns, leaving only chambers with positive measure.
 """
 
-using CDDLib, Polyhedra, LinearAlgebra, JSON3, Printf
+using JSON3, Printf
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
 struct Term
-    c_num   :: Int64
-    c_den   :: Int64
+    c_num    :: Int64
+    c_den    :: Int64
     v_coeffs :: Vector{Int64}
 end
 
-struct Clause
-    true_cond_idxs :: Vector{Int64}   # 0-based indices into cond_eff_lhs
-    terms          :: Vector{Term}
+struct Case
+    active_sigma :: Vector{Int64}   # 0/1 per active condition
+    terms        :: Vector{Term}
 end
 
 struct UniqueWeight
-    clauses       :: Vector{Clause}
-    default_terms :: Vector{Term}
+    active_cond_idxs :: Vector{Int64}   # 0-based indices into conditions
+    cases            :: Vector{Case}
 end
 
 # ---------------------------------------------------------------------------
@@ -53,19 +60,12 @@ function load_compact(path::String)
     n_pairs  = Int(data.n_pairs)
     n_leaves = Int(data.n_leaves)
 
-    cond_eff_lhs = Rational{BigInt}[
-        Rational{BigInt}(data.cond_eff_lhs[i][j])
-        for i in 1:n_conds, j in 1:n_atoms]
-
     state_energy_coeffs = [
         Int64[Int64(data.state_energy_coeffs[s][j]) for j in 1:n_atoms]
         for s in 1:n_states]
 
-    initial_sigma = Int[Int(x) for x in data.initial_sigma]
-    initial_jstar = Rational{BigInt}[
-        Rational{BigInt}(Int64(data.initial_jstar[j][1]),
-                         Int64(data.initial_jstar[j][2]))
-        for j in 1:n_atoms]
+    # Feasible sigma patterns from Mathematica Phase 2
+    feasible_sigmas = [Int[Int(x) for x in s] for s in data.feasible_sigmas]
 
     function parse_terms(raw_terms)
         Term[Term(
@@ -75,16 +75,16 @@ function load_compact(path::String)
             for t in raw_terms]
     end
 
-    function parse_clause(rc)
-        Clause(
-            Int64[Int64(x) for x in rc.true_cond_idxs],
+    function parse_case(rc)
+        Case(
+            Int64[Int64(x) for x in rc.active_sigma],
             parse_terms(rc.terms))
     end
 
     unique_weights = UniqueWeight[
         UniqueWeight(
-            Clause[parse_clause(c) for c in uw.clauses],
-            parse_terms(uw.default_terms))
+            Int64[Int64(x) for x in uw.active_cond_idxs],
+            Case[parse_case(c) for c in uw.cases])
         for uw in data.unique_weights]
 
     leaf_weight_idx = Int64[Int64(x) + 1 for x in data.leaf_weight_idx]  # 1-based
@@ -94,112 +94,9 @@ function load_compact(path::String)
     pair_ji_srcs = [Int64[Int64(x)+1 for x in s] for s in data.pair_ji_srcs]
 
     return (n_atoms, n_conds, n_states, n_pairs, n_leaves,
-            cond_eff_lhs, state_energy_coeffs,
-            initial_sigma, initial_jstar,
+            state_energy_coeffs, feasible_sigmas,
             unique_weights, leaf_weight_idx,
             pair_states, pair_ij_srcs, pair_ji_srcs)
-end
-
-# ---------------------------------------------------------------------------
-# Phase 2: Chamber enumeration
-# ---------------------------------------------------------------------------
-
-const R = Rational{BigInt}
-
-"""
-Build the H-representation polytope for a given sigma pattern.
-Mirrors Mathematica's FindInstance exactly:
-  sigma[i]=1: condition is True  → eff_lhs[i]·J >= 0  (non-strict, b = 0)
-  sigma[i]=0: condition is False → eff_lhs[i]·J <  0  (strict,    b = -1)
-The strict False constraint excludes the origin, so the polytope is non-trivial.
-"""
-function make_chamber_poly(sigma01::Vector{Int}, eff_lhs::Matrix{R}, lib)
-    k, n = size(eff_lhs)
-    rows = Vector{R}[]; bs = R[]
-    for i in 1:k
-        if sigma01[i] == 1
-            # True: eff_lhs * J >= 0  →  -eff_lhs * J <= 0
-            push!(rows, -eff_lhs[i,:]); push!(bs, R(0))
-        else
-            # False: eff_lhs * J < 0  →  eff_lhs * J <= -1  (strict via -1)
-            push!(rows,  eff_lhs[i,:]); push!(bs, R(-1))
-        end
-    end
-    A = reduce(vcat, [reshape(r, 1, length(r)) for r in rows])
-    polyhedron(hrep(A, bs), lib)
-end
-
-"""
-Check strict feasibility: does the sigma pattern have a strictly interior point?
-Returns (is_feasible, poly).
-"""
-function chamber_feasible(sigma01, eff_lhs, lib)
-    poly = make_chamber_poly(sigma01, eff_lhs, lib)
-    return !isempty(poly), poly
-end
-
-"""
-Get a rational point for a feasible chamber using CDDLib vertex enumeration.
-CDDLib's vertices are on the boundary of the feasible region, which is fine
-for Mathematica compatibility: the DB check only uses J* for substitution,
-not for strictness testing.
-Returns nothing if polytope is empty (no feasible J).
-"""
-function get_interior_point(sigma01::Vector{Int}, eff_lhs::Matrix{R}, poly)
-    vr  = vrep(poly)
-    pts = collect(Polyhedra.points(vr))
-    return isempty(pts) ? nothing : first(pts)
-end
-
-"""
-BFS over sign patterns to enumerate all feasible chambers.
-Starts from the Mathematica-provided (initial_sigma, initial_jstar) as the
-first chamber (even if it has no strictly interior point — jStar on boundary
-is still a valid evaluation point for the DB check).
-Returns list of (sigma, jStar) pairs.
-"""
-function enumerate_chambers(
-    eff_lhs::Matrix{R},
-    initial_sigma::Vector{Int},
-    initial_jstar::Vector{R},
-    lib)
-
-    k, n = size(eff_lhs)
-    chambers = Tuple{Vector{Int}, Vector{R}}[]
-    visited  = Dict{Vector{Int}, Bool}()
-
-    # Always include the initial (Mathematica) chamber as the first entry
-    push!(chambers, (initial_sigma, initial_jstar))
-    visited[initial_sigma] = true
-    queue = [initial_sigma]
-
-    n_checked = 0
-    while !isempty(queue)
-        sigma = popfirst!(queue)
-        for i in 1:k
-            sigma2 = copy(sigma)
-            sigma2[i] = 1 - sigma2[i]
-            haskey(visited, sigma2) && continue
-            n_checked += 1
-            feas, poly = chamber_feasible(sigma2, eff_lhs, lib)
-            if feas
-                J2 = get_interior_point(sigma2, eff_lhs, poly)
-                if J2 !== nothing
-                    visited[sigma2] = true
-                    push!(chambers, (sigma2, J2))
-                    push!(queue, sigma2)
-                else
-                    visited[sigma2] = false
-                end
-            else
-                visited[sigma2] = false
-            end
-        end
-    end
-
-    @printf(stderr, "Phase 2: %d chambers  (%d patterns checked)\n",
-            length(chambers), n_checked)
-    return chambers
 end
 
 # ---------------------------------------------------------------------------
@@ -207,83 +104,91 @@ end
 # ---------------------------------------------------------------------------
 
 """
-Find the matching clause for a given sigma pattern and unique weight.
-Uses first-match Piecewise semantics: first clause whose true_cond_idxs
-are all satisfied (sigma[idx+1]==1) is used; falls back to default_terms.
+Look up the Boltzmann terms for a unique weight under a given sigma pattern.
+Projects sigma to the weight's active conditions and finds the matching case.
+Avoids allocations: uses element-wise comparison without building a new vector.
 """
 function get_terms(uw::UniqueWeight, sigma01::Vector{Int}) :: Vector{Term}
-    for clause in uw.clauses
-        if all(sigma01[idx + 1] == 1 for idx in clause.true_cond_idxs)
-            return clause.terms
+    @inbounds for c in uw.cases
+        match = true
+        for (j, idx) in enumerate(uw.active_cond_idxs)
+            if sigma01[idx + 1] != c.active_sigma[j]
+                match = false; break
+            end
         end
+        match && return c.terms
     end
-    return uw.default_terms
-end
-
-"""
-Evaluate Boltzmann exponent: v = dot(v_coeffs, jStar).
-"""
-@inline function eval_v(v_coeffs::Vector{Int64}, jStar::Vector{R}) :: R
-    s = R(0)
-    for j in eachindex(v_coeffs)
-        iszero(v_coeffs[j]) && continue
-        s += R(v_coeffs[j]) * jStar[j]
-    end
-    s
+    return Term[]  # unreachable for valid export data
 end
 
 """
 Run Phase 3 DB check over all chambers.
+
+Key optimisations:
+  1. Pre-compute which Case applies to each unique weight once per chamber
+     (n_chambers × n_weights lookups instead of one per pair-leaf).
+  2. Group by integer coefficient vector (v_coeffs + energy_coeffs) rather
+     than by the Rational dot-product value.  The grouping is algebraically
+     exact: two terms belong to the same Boltzmann class iff their combined
+     integer coefficient vector is identical for all J.  This eliminates all
+     BigInt arithmetic from Phase 3.
+
 Returns (pass::Bool, violations::Vector{Tuple{Int,Int,Int}}).
 """
 function run_phase3(
-    chambers       :: Vector{Tuple{Vector{Int}, Vector{R}}},
-    unique_weights :: Vector{UniqueWeight},
-    leaf_weight_idx :: Vector{Int64},
-    pair_states    :: Vector{Tuple{Int64,Int64}},
-    pair_ij_srcs   :: Vector{Vector{Int64}},
-    pair_ji_srcs   :: Vector{Vector{Int64}},
+    feasible_sigmas     :: Vector{Vector{Int}},
+    unique_weights      :: Vector{UniqueWeight},
+    leaf_weight_idx     :: Vector{Int64},
+    pair_states         :: Vector{Tuple{Int64,Int64}},
+    pair_ij_srcs        :: Vector{Vector{Int64}},
+    pair_ji_srcs        :: Vector{Vector{Int64}},
     state_energy_coeffs :: Vector{Vector{Int64}},
-    n_atoms        :: Int)
+    n_atoms             :: Int)
 
     n_pairs   = length(pair_states)
-    n_regions = length(chambers)
+    n_weights = length(unique_weights)
 
     violations = Tuple{Int,Int,Int}[]
-    groups     = Dict{R, R}()
+    groups     = Dict{Vector{Int64}, Rational{Int64}}()
 
-    for (reg_idx, (sigma, jStar)) in enumerate(chambers)
-        # Energy values per state (dot product with jStar)
-        energy_jstar = [eval_v(state_energy_coeffs[s], jStar)
-                        for s in eachindex(state_energy_coeffs)]
+    # Per-chamber buffer: active terms for each unique weight
+    active_terms = Vector{Vector{Term}}(undef, n_weights)
+    # Reusable key buffer (avoids allocation in hot loop)
+    key_buf      = Vector{Int64}(undef, n_atoms)
+
+    for (reg_idx, sigma) in enumerate(feasible_sigmas)
+        # Pre-compute which terms are active for each unique weight this chamber.
+        for wi in 1:n_weights
+            active_terms[wi] = get_terms(unique_weights[wi], sigma)
+        end
 
         for p in 1:n_pairs
             isempty(pair_ij_srcs[p]) && isempty(pair_ji_srcs[p]) && continue
 
             empty!(groups)
             i, j = pair_states[p]
+            ei   = state_energy_coeffs[i]
+            ej   = state_energy_coeffs[j]
 
             # T(i→j) × Exp(-β·E_i): add contributions
             for leaf_idx in pair_ij_srcs[p]
-                uw = unique_weights[leaf_weight_idx[leaf_idx]]
-                for term in get_terms(uw, sigma)
+                for term in active_terms[leaf_weight_idx[leaf_idx]]
                     iszero(term.c_num) && continue
-                    v   = eval_v(term.v_coeffs, jStar)
-                    key = v + energy_jstar[i]
-                    c   = R(term.c_num, term.c_den)
-                    groups[key] = get(groups, key, R(0)) + c
+                    @inbounds @. key_buf = term.v_coeffs + ei
+                    c = Rational{Int64}(term.c_num, term.c_den)
+                    key = copy(key_buf)
+                    groups[key] = get(groups, key, zero(Rational{Int64})) + c
                 end
             end
 
             # T(j→i) × Exp(-β·E_j): subtract contributions
             for leaf_idx in pair_ji_srcs[p]
-                uw = unique_weights[leaf_weight_idx[leaf_idx]]
-                for term in get_terms(uw, sigma)
+                for term in active_terms[leaf_weight_idx[leaf_idx]]
                     iszero(term.c_num) && continue
-                    v   = eval_v(term.v_coeffs, jStar)
-                    key = v + energy_jstar[j]
-                    c   = R(term.c_num, term.c_den)
-                    groups[key] = get(groups, key, R(0)) - c
+                    @inbounds @. key_buf = term.v_coeffs + ej
+                    c = Rational{Int64}(term.c_num, term.c_den)
+                    key = copy(key_buf)
+                    groups[key] = get(groups, key, zero(Rational{Int64})) - c
                 end
             end
 
@@ -312,31 +217,17 @@ function main()
 
     t_load = @elapsed begin
         (n_atoms, n_conds, n_states, n_pairs, n_leaves,
-         cond_eff_lhs, state_energy_coeffs,
-         initial_sigma, initial_jstar,
+         state_energy_coeffs, feasible_sigmas,
          unique_weights, leaf_weight_idx,
          pair_states, pair_ij_srcs, pair_ji_srcs) = load_compact(ARGS[1])
     end
-    @printf(stderr, "Load: %.2fs  (%d conds, %d states, %d pairs, %d leaves, %d unique weights)\n",
-            t_load, n_conds, n_states, n_pairs, n_leaves, length(unique_weights))
-
-    lib = CDDLib.Library(:exact)
-
-    # Phase 2: chamber enumeration
-    t_p2 = @elapsed begin
-        chambers = if n_conds == 0 || n_atoms == 0
-            # Trivial: single chamber with empty jStar
-            [(Int[], R[])]
-        else
-            enumerate_chambers(cond_eff_lhs, initial_sigma, initial_jstar, lib)
-        end
-    end
-    @printf(stderr, "Phase 2: %.2fs\n", t_p2)
+    @printf(stderr, "Load: %.2fs  (%d conds, %d states, %d pairs, %d leaves, %d unique weights, %d chambers)\n",
+            t_load, n_conds, n_states, n_pairs, n_leaves, length(unique_weights), length(feasible_sigmas))
 
     # Phase 3: DB check
     t_p3 = @elapsed begin
         pass, violations = run_phase3(
-            chambers, unique_weights, leaf_weight_idx,
+            feasible_sigmas, unique_weights, leaf_weight_idx,
             pair_states, pair_ij_srcs, pair_ji_srcs,
             state_energy_coeffs, n_atoms)
     end
