@@ -1137,9 +1137,10 @@ $dbcCompactWeight[w_, allConds_List, symParamList_List, \[Beta]_] :=
     <|"active_cond_idxs" -> (activeIdx - 1),  (* 0-based for Julia *)
       "cases" -> cases|>]
 
-(* Export compact Phase 1 structure to JSON for Julia Phase 3.
-   Includes the feasible sigma patterns from Mathematica's Phase 2 BFS so
-   Julia only needs to do Phase 3 (DB check per chamber).
+(* Export compact Phase 1 structure to JSON for Julia Phase 2+3.
+   When feasibleRegions is non-empty, exports those sigma patterns as
+   feasible_sigmas (Julia does Phase 3 only).  When empty, exports
+   initial_sigma + cond_is_strict so Julia can run Phase 2 via HiGHS LP.
    Returns True on success, $Failed on error.                        *)
 $dbcExportCompact[repLeaves_Association, repToOrbitMap_Association,
                   energy_, allStates_List, nGrid_Integer,
@@ -1189,10 +1190,12 @@ $dbcExportCompact[repLeaves_Association, repToOrbitMap_Association,
     leafFlatIdx  = AssociationThread[neededLeaves -> Range[Length[neededLeaves]]];
 
     (* ---- Condition effective-LHS: sigma[i]=1 iff eff_lhs[i].J >= 0 ---- *)
-    condEffSign = Table[If[MatchQ[allConds[[i]], _Less | _LessEqual], -1, 1], {i, k}];
-    condEffLhs  = Table[
+    condEffSign  = Table[If[MatchQ[allConds[[i]], _Less | _LessEqual], -1, 1], {i, k}];
+    condEffLhs   = Table[
       condEffSign[[i]] * Table[Coefficient[allConds[[i, 1]], allSymParams[[j]]], {j, n}],
     {i, k}];
+    (* Strict flag: True for Less/Greater (boundary excluded); False for LessEqual/GreaterEqual *)
+    condIsStrict = Table[MatchQ[allConds[[i]], _Less | _Greater], {i, k}];
 
     (* ---- State energy coefficients (linear in coupling atoms) ---- *)
     energyCoeffs = Table[
@@ -1235,6 +1238,8 @@ $dbcExportCompact[repLeaves_Association, repToOrbitMap_Association,
       "n_pairs"            -> Length[pairsArr],
       "n_leaves"           -> Length[neededLeaves],
       "cond_eff_lhs"       -> condEffLhs,
+      "cond_is_strict"     -> condIsStrict,
+      "initial_sigma"      -> initialSigma,
       "state_energy_coeffs"-> energyCoeffs,
       "feasible_sigmas"    -> feasibleSigmas,
       "unique_weights"     -> uniqueWeightData,
@@ -1250,10 +1255,13 @@ $dbcExportCompact[repLeaves_Association, repToOrbitMap_Association,
     True]
 
 
-(* Run EBE Phase 2 (Mathematica FindInstance BFS) + Phase 3 (Julia) via compact export.
-   Phase 2 runs in Mathematica to correctly handle the hyperplane arrangement; only
-   Phase 3 (the expensive per-chamber DB check) is delegated to Julia.
-   Falls back to Mathematica EBE if export or subprocess fails.                        *)
+(* Run EBE Phase 2 (Julia HiGHS LP BFS) + Phase 3 (Julia integer-key DB check).
+   Phase 2 is delegated to Julia: the compact structure is exported with an empty
+   feasible_sigmas list and Julia's HiGHS LP BFS enumerates all genuine open chambers
+   (~19× faster per LP call than Mathematica FindInstance).
+   When precomputedChambers are available (from D4 EBE), they are passed directly
+   as feasible_sigmas and Julia runs Phase 3 only.
+   Falls back to Mathematica EBE if export or subprocess fails.                       *)
 $dbcEBECheckLeavesJulia[repLeaves_Association, repToOrbitMap_Association,
                          energy_, allStates_List, nGrid_Integer,
                          allSymParams_List, ebeMaxK_Integer,
@@ -1261,8 +1269,9 @@ $dbcEBECheckLeavesJulia[repLeaves_Association, repToOrbitMap_Association,
                          precomputedChambers_, precomputedConds_,
                          juliaScript_String] :=
   Module[{allLeaves, allConds, k, jStar, sigma,
-          feasibleRegions, visitedSigmas, bfsQueue, sigma2, constraints2, jStar2,
-          nAtoms, condEL, contraPairs, nBefore,
+          feasibleRegions,
+          nAtoms, condEL, contraPairsFF, contraPairsTT, nBefore,
+          exportSigma, exportJStar, exportFeasible,
           tmpIn, tmpOut, exitCode, resultText, vjson},
 
     (* Phase 1: extract Piecewise conditions *)
@@ -1282,100 +1291,74 @@ $dbcEBECheckLeavesJulia[repLeaves_Association, repToOrbitMap_Association,
       Return[$dbcSZCheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
                                allSymParams, szFallbackReps, tol]]];
 
-    (* Phase 2: non-strict BFS over the hyperplane arrangement.
-       Uses !allConds[[j]] (non-strict negation) for False conditions so that
-       degenerate boundary patterns (where both conditions of a contradictory pair
-       are False) are reachable — these act as bridges between the disconnected
-       octants of the arrangement and ensure the BFS covers all genuine open chambers.
-       After the BFS, degenerate patterns are filtered out algebraically.          *)
-    feasibleRegions = {};
+    (* Determine what to export:
+       (a) Precomputed chambers from D4 EBE — apply degenerate filter, export as
+           feasible_sigmas; Julia does Phase 3 only.
+       (b) No precomputed chambers — export empty feasible_sigmas + initial_sigma;
+           Julia runs Phase 2 (HiGHS LP BFS + degenerate filter) then Phase 3.    *)
     If[precomputedChambers =!= {} &&
          (precomputedConds === {} || SubsetQ[precomputedConds, allConds]),
+
+      (* (a) Reuse precomputed chambers — apply degenerate filter then export *)
       feasibleRegions = precomputedChambers;
       Print["  EBE: ", Length[feasibleRegions],
-            " feasible region(s) (reused from D4 EBE check)"],
+            " feasible region(s) (reused from D4 EBE check)"];
+      nAtoms = Length[allSymParams];
+      If[k > 0 && nAtoms > 0,
+        condEL = Table[
+          If[MatchQ[allConds[[i]], _Less | _LessEqual], -1, 1] *
+          Table[Coefficient[allConds[[i, 1]], allSymParams[[j]]], {j, nAtoms}],
+          {i, k}];
+        contraPairsFF = {}; contraPairsTT = {};
+        Do[
+          If[i < j && condEL[[i]] === -condEL[[j]],
+            Which[
+              MatchQ[allConds[[i]], _Less | _Greater] && MatchQ[allConds[[j]], _Less | _Greater],
+              AppendTo[contraPairsFF, {i, j}],
+              MatchQ[allConds[[i]], _LessEqual | _GreaterEqual] &&
+                MatchQ[allConds[[j]], _LessEqual | _GreaterEqual],
+              AppendTo[contraPairsTT, {i, j}]]],
+          {i, k}, {j, k}];
+        If[Length[contraPairsFF] + Length[contraPairsTT] > 0,
+          nBefore = Length[feasibleRegions];
+          feasibleRegions = Select[feasibleRegions, Function[fr,
+            !AnyTrue[contraPairsFF, fr[[1,#[[1]]]]==0 && fr[[1,#[[2]]]]==0 &] &&
+            !AnyTrue[contraPairsTT, fr[[1,#[[1]]]]==1 && fr[[1,#[[2]]]]==1 &]]];
+          If[Length[feasibleRegions] < nBefore,
+            Print["  EBE: ", Length[feasibleRegions],
+                  " genuine open chamber(s) (removed ",
+                  nBefore - Length[feasibleRegions], " degenerate boundary patterns)"]]]];
+      exportSigma  = feasibleRegions[[1,1]];
+      exportJStar  = feasibleRegions[[1,2]];
+      exportFeasible = feasibleRegions,
+
+      (* (b) No precomputed chambers — let Julia do Phase 2 *)
       If[precomputedChambers =!= {},
-        Print["  EBE: WARNING — chamber reuse skipped. Running Phase 2 from scratch."]];
+        Print["  EBE: WARNING — chamber reuse skipped. Julia will run Phase 2."]];
       If[k == 0 || Length[allSymParams] == 0,
-        feasibleRegions = {{Table[1, {k}], {}}};
-        Print["  EBE: 1 feasible region (no branch conditions)"],
+        (* No coupling-constant conditions: trivial single chamber *)
+        exportSigma = {}; exportJStar = {}; exportFeasible = {},
+        (* k > 0: get initial sigma from one FindInstance call (Julia BFS starts here) *)
         jStar = Quiet[FindInstance[True, allSymParams, Rationals, 1]];
         If[jStar === {} || jStar === {{}},
-          feasibleRegions = {{Table[1, {k}], {}}};
-          Print["  EBE: 1 feasible region (fallback)"],
-          jStar = First[jStar];
-          sigma = Table[If[TrueQ[allConds[[i]] /. jStar], 1, 0], {i, k}];
-          visitedSigmas = <|sigma -> jStar|>;
-          feasibleRegions = {{sigma, jStar}};
-          bfsQueue = {sigma};
-          While[bfsQueue =!= {},
-            sigma = First[bfsQueue]; bfsQueue = Rest[bfsQueue];
-            Do[
-              sigma2 = ReplacePart[sigma, i -> 1 - sigma[[i]]];
-              If[!KeyExistsQ[visitedSigmas, sigma2],
-                constraints2 = And @@ Table[
-                  If[sigma2[[j]] == 1, allConds[[j]], !allConds[[j]]], {j, k}];
-                jStar2 = Quiet[FindInstance[constraints2, allSymParams, Rationals, 1]];
-                If[jStar2 =!= {} && jStar2 =!= {{}},
-                  visitedSigmas[sigma2] = First[jStar2];
-                  AppendTo[feasibleRegions, {sigma2, First[jStar2]}];
-                  AppendTo[bfsQueue, sigma2],
-                  visitedSigmas[sigma2] = None]],
-              {i, k}]];
-          Print["  EBE: ", Length[feasibleRegions], " feasible region(s)  (",
-                Length[visitedSigmas], " sign patterns visited via BFS)"]]]];
-
-    (* Filter degenerate sigma patterns that lie on a measure-zero boundary hyperplane.
-       For every pair of conditions (i,j) that partition the same hyperplane
-       (condEffLhs[i] = -condEffLhs[j]), the degenerate case is:
-         * Strict pairs     (Less/Greater):       both conditions FALSE → L=0 boundary
-         * Non-strict pairs (LessEqual/GreaterEqual): both conditions TRUE  → L=0 boundary
-         * Mixed pairs (e.g. Less + GreaterEqual): their union covers all of R and
-           their intersection is empty — no degenerate boundary; skip.             *)
-    nAtoms = Length[allSymParams];
-    If[k > 0 && nAtoms > 0,
-      condEL = Table[
-        If[MatchQ[allConds[[i]], _Less | _LessEqual], -1, 1] *
-        Table[Coefficient[allConds[[i, 1]], allSymParams[[j]]], {j, nAtoms}],
-        {i, k}];
-      (* Collect pairs classified by strictness *)
-      contraPairsFF = {};  (* strict pairs: degenerate when both False *)
-      contraPairsTT = {};  (* non-strict pairs: degenerate when both True *)
-      Do[
-        If[i < j && condEL[[i]] === -condEL[[j]],
-          Which[
-            MatchQ[allConds[[i]], _Less | _Greater] &&
-              MatchQ[allConds[[j]], _Less | _Greater],
-            AppendTo[contraPairsFF, {i, j}],
-            MatchQ[allConds[[i]], _LessEqual | _GreaterEqual] &&
-              MatchQ[allConds[[j]], _LessEqual | _GreaterEqual],
-            AppendTo[contraPairsTT, {i, j}]
-            (* Mixed pairs: no degenerate boundary, skip *)
-          ]],
-        {i, k}, {j, k}];
-      If[Length[contraPairsFF] + Length[contraPairsTT] > 0,
-        nBefore = Length[feasibleRegions];
-        feasibleRegions = Select[feasibleRegions, Function[fr,
-          !AnyTrue[contraPairsFF,
-            fr[[1, #[[1]]]] == 0 && fr[[1, #[[2]]]] == 0 &] &&
-          !AnyTrue[contraPairsTT,
-            fr[[1, #[[1]]]] == 1 && fr[[1, #[[2]]]] == 1 &]]];
-        If[Length[feasibleRegions] < nBefore,
-          Print["  EBE: ", Length[feasibleRegions],
-                " genuine open chamber(s) (removed ", nBefore - Length[feasibleRegions],
-                " degenerate boundary patterns)"]]]];
+          Print["  EBE: FindInstance failed \[LongDash] falling back to Mathematica EBE"];
+          Return[$dbcEBECheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
+                                    allSymParams, ebeMaxK, szFallbackReps, tol, {}, {}]]];
+        jStar = First[jStar];
+        sigma = Table[If[TrueQ[allConds[[i]] /. jStar], 1, 0], {i, k}];
+        exportSigma = sigma; exportJStar = jStar; exportFeasible = {}]];
 
     tmpIn  = FileNameJoin[{$TemporaryDirectory, "szdbc_compact_in.json"}];
     tmpOut = FileNameJoin[{$TemporaryDirectory, "szdbc_compact_out.json"}];
 
     If[$dbcExportCompact[repLeaves, repToOrbitMap, energy, allStates, nGrid,
                           allSymParams, allConds,
-                          feasibleRegions[[1,1]], feasibleRegions[[1,2]],
-                          tmpIn, feasibleRegions] === $Failed,
+                          exportSigma, exportJStar,
+                          tmpIn, exportFeasible] === $Failed,
       Print["  Julia: compact export failed \[LongDash] falling back to Mathematica EBE"];
       Return[$dbcEBECheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
                                 allSymParams, ebeMaxK, szFallbackReps, tol,
-                                feasibleRegions, allConds]]];
+                                exportFeasible, allConds]]];
 
     exitCode = Run["julia --project=" <> DirectoryName[juliaScript] <>
                    " " <> juliaScript <> " " <> tmpIn <> " " <> tmpOut];
@@ -1385,7 +1368,7 @@ $dbcEBECheckLeavesJulia[repLeaves_Association, repToOrbitMap_Association,
             ") \[LongDash] falling back to Mathematica EBE"];
       Return[$dbcEBECheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
                                 allSymParams, ebeMaxK, szFallbackReps, tol,
-                                feasibleRegions, allConds]]];
+                                exportFeasible, allConds]]];
 
     resultText = ReadString[tmpOut];
     DeleteFile[tmpIn]; DeleteFile[tmpOut];
@@ -1399,7 +1382,7 @@ $dbcEBECheckLeavesJulia[repLeaves_Association, repToOrbitMap_Association,
       Print["  Julia: unparseable output \[LongDash] falling back to Mathematica EBE"];
       Return[$dbcEBECheckLeaves[repLeaves, repToOrbitMap, energy, allStates, nGrid,
                                 allSymParams, ebeMaxK, szFallbackReps, tol,
-                                feasibleRegions, allConds]]];
+                                exportFeasible, allConds]]];
 
     Map[Function[v,
       <|"pair" -> {allStates[[v[[1]]]], allStates[[v[[2]]]]},

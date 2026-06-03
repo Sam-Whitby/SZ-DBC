@@ -1,31 +1,33 @@
 """
-SZ-DBC Phase 3 in Julia — compact structure approach.
+SZ-DBC Phase 2+3 in Julia — HiGHS LP chamber enumeration + integer-key DB check.
 
 Usage: julia --project=<dir> ebe.jl <compact_in.json> <output.json>
 
-Mathematica runs Phase 1 (condition extraction) and Phase 2 (non-strict BFS +
-degenerate filter), exports a compact structure with:
-  - 'feasible_sigmas': the genuine open chambers found by Phase 2
-  - per-unique-weight compact Piecewise structure (sigma-substitution)
+Mathematica runs Phase 1 (condition extraction) and exports a compact structure.
+When feasible_sigmas is empty, this script runs:
+  Phase 2 — BFS over the hyperplane arrangement using HiGHS LP feasibility checks.
+            Non-strict negation (>= for False strict conditions) bridges all octants.
+            Degenerate boundary patterns are filtered algebraically after BFS.
+  Phase 3 — For each genuine chamber, groups DB terms by integer exponent coefficient
+            vector and checks that each group sums to zero (exact Rational{Int64}).
 
-This script runs Phase 3 only: for each sigma pattern, pre-computes active
-Boltzmann terms, groups them by integer exponent coefficient vector, and checks
-that the DB residual is exactly zero for every communicating state pair.
+When feasible_sigmas is non-empty (precomputed, e.g. reused from D4 EBE check),
+Phase 2 is skipped and only Phase 3 runs.
 
-Correctness:
+Phase 2 correctness (LP encoding):
+  sigma[i]=1 with strict condition:     condEffLhs[i]·J >= eps  (>0 in the interior)
+  sigma[i]=1 with non-strict condition: condEffLhs[i]·J >= 0
+  sigma[i]=0 with strict condition:    -condEffLhs[i]·J >= 0    (>=0, includes boundary)
+  sigma[i]=0 with non-strict condition:-condEffLhs[i]·J >= eps  (>0, strict negation)
+  Degenerate filter: strict pairs (both False) and non-strict pairs (both True) removed.
+
+Phase 3 correctness:
   Grouping by integer coefficient vector (v_coeffs + energy_coeffs[state]) is
   algebraically exact: two terms cancel iff their combined exponent function
-  dot(v, J) is identical for ALL J, which happens iff the integer vectors are
-  equal.  This is equivalent to Mathematica's \$dbcIsExpZero grouping and does
-  not require evaluating at any specific J*.
-
-  The 'feasible_sigmas' from Mathematica's Phase 2 cover all genuine open
-  chambers of the hyperplane arrangement.  Phase 2 uses a non-strict BFS that
-  bridges disconnected octants through degenerate boundary patterns, then filters
-  those patterns, leaving only chambers with positive measure.
+  dot(v, J) is identical for ALL J, which happens iff the integer vectors are equal.
 """
 
-using JSON3, Printf
+using HiGHS, JSON3, Printf
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -60,11 +62,17 @@ function load_compact(path::String)
     n_pairs  = Int(data.n_pairs)
     n_leaves = Int(data.n_leaves)
 
+    # Condition data for Phase 2
+    cond_eff_lhs = Vector{Int64}[
+        Int64[Int64(x) for x in v] for v in data.cond_eff_lhs]
+    cond_is_strict = Bool[Bool(x) for x in data.cond_is_strict]
+    initial_sigma  = Int[Int(x) for x in data.initial_sigma]
+
     state_energy_coeffs = [
         Int64[Int64(data.state_energy_coeffs[s][j]) for j in 1:n_atoms]
         for s in 1:n_states]
 
-    # Feasible sigma patterns from Mathematica Phase 2
+    # Feasible sigma patterns (empty → Julia runs Phase 2)
     feasible_sigmas = [Int[Int(x) for x in s] for s in data.feasible_sigmas]
 
     function parse_terms(raw_terms)
@@ -94,9 +102,136 @@ function load_compact(path::String)
     pair_ji_srcs = [Int64[Int64(x)+1 for x in s] for s in data.pair_ji_srcs]
 
     return (n_atoms, n_conds, n_states, n_pairs, n_leaves,
+            cond_eff_lhs, cond_is_strict, initial_sigma,
             state_energy_coeffs, feasible_sigmas,
             unique_weights, leaf_weight_idx,
             pair_states, pair_ij_srcs, pair_ji_srcs)
+end
+
+# ---------------------------------------------------------------------------
+# Phase 2: BFS over hyperplane arrangement using HiGHS LP
+# ---------------------------------------------------------------------------
+
+"""
+Test whether a sigma pattern is feasible using a HiGHS LP.
+
+For each condition i:
+  sigma[i]=1, strict:     condEffLhs[i]·J >= eps   (interior of positive halfspace)
+  sigma[i]=1, non-strict: condEffLhs[i]·J >= 0
+  sigma[i]=0, strict:    -condEffLhs[i]·J >= 0     (non-strict negation ≥ 0)
+  sigma[i]=0, non-strict:-condEffLhs[i]·J >= eps   (strict negation > 0)
+
+The non-strict representation for sigma=0 of a strict condition is what allows
+the BFS to visit degenerate boundary patterns and bridge disconnected octants.
+"""
+function is_feasible(sigma       :: Vector{Int},
+                     cond_eff_lhs :: Vector{Vector{Int64}},
+                     cond_is_strict :: Vector{Bool},
+                     n_atoms     :: Int,
+                     eps         :: Float64) :: Bool
+    isempty(sigma) && return true  # k=0: no conditions, always feasible
+    h = HiGHS.Highs_create()
+    HiGHS.Highs_setBoolOptionValue(h, "output_flag", false)
+    HiGHS.Highs_setBoolOptionValue(h, "solver_output_flag", false)
+    for _ in 1:n_atoms
+        HiGHS.Highs_addVar(h, -1e10, 1e10)
+    end
+    inds = Int32[j-1 for j in 1:n_atoms]
+    for i in eachindex(sigma)
+        v    = cond_eff_lhs[i]
+        sign = sigma[i] == 1 ? 1.0 : -1.0
+        coeffs = Float64[sign * v[j] for j in 1:n_atoms]
+        # lb = eps when the constraint is strict in the active direction:
+        #   sigma=1 + strict condition  →  condEffLhs·J > 0  →  lb = eps
+        #   sigma=1 + non-strict        →  condEffLhs·J ≥ 0  →  lb = 0
+        #   sigma=0 + strict (non-strict negation ≥0) →  lb = 0
+        #   sigma=0 + non-strict (strict negation >0) →  lb = eps
+        lb = ((sigma[i] == 1) == cond_is_strict[i]) ? eps : 0.0
+        HiGHS.Highs_addRow(h, lb, 1e30, n_atoms, inds, coeffs)
+    end
+    HiGHS.Highs_run(h)
+    status = HiGHS.Highs_getModelStatus(h)
+    HiGHS.Highs_destroy(h)
+    return status == 7  # 7 = kOptimal (feasible LP)
+end
+
+"""
+Remove degenerate sigma patterns (those lying on a measure-zero boundary hyperplane).
+For each contradictory pair (i,j) with condEffLhs[i] == -condEffLhs[j]:
+  - Strict pairs (both Less/Greater):           filter when sigma[i]==0 && sigma[j]==0
+  - Non-strict pairs (both LessEqual/GreaterEqual): filter when sigma[i]==1 && sigma[j]==1
+  - Mixed pairs: no degenerate boundary exists; skip.
+"""
+function filter_degenerate(feasible_sigmas :: Vector{Vector{Int}},
+                            cond_eff_lhs   :: Vector{Vector{Int64}},
+                            cond_is_strict :: Vector{Bool},
+                            n_conds        :: Int) :: Vector{Vector{Int}}
+    contra_ff = Tuple{Int,Int}[]
+    contra_tt = Tuple{Int,Int}[]
+    for i in 1:n_conds, j in (i+1):n_conds
+        if cond_eff_lhs[i] == -cond_eff_lhs[j]
+            if cond_is_strict[i] && cond_is_strict[j]
+                push!(contra_ff, (i, j))
+            elseif !cond_is_strict[i] && !cond_is_strict[j]
+                push!(contra_tt, (i, j))
+            end
+        end
+    end
+    isempty(contra_ff) && isempty(contra_tt) && return feasible_sigmas
+
+    n_before = length(feasible_sigmas)
+    filtered = filter(feasible_sigmas) do sigma
+        !any(sigma[i] == 0 && sigma[j] == 0 for (i, j) in contra_ff) &&
+        !any(sigma[i] == 1 && sigma[j] == 1 for (i, j) in contra_tt)
+    end
+    n_removed = n_before - length(filtered)
+    if n_removed > 0
+        @printf(stderr, "  EBE: %d genuine open chamber(s) (removed %d degenerate boundary patterns)\n",
+                length(filtered), n_removed)
+    end
+    filtered
+end
+
+"""
+BFS over the hyperplane arrangement to find all genuine open chambers.
+Starts from initial_sigma (an interior point of one chamber) and explores
+neighbours by flipping one bit at a time, testing feasibility via HiGHS LP.
+After BFS, applies the degenerate filter.
+"""
+function run_phase2(initial_sigma  :: Vector{Int},
+                    cond_eff_lhs   :: Vector{Vector{Int64}},
+                    cond_is_strict :: Vector{Bool},
+                    n_atoms        :: Int,
+                    n_conds        :: Int) :: Vector{Vector{Int}}
+    if n_conds == 0
+        @printf(stderr, "  EBE: 1 feasible region (no branch conditions)\n")
+        return [Int[]]
+    end
+
+    eps     = 1e-6
+    visited = Set{Vector{Int}}()
+    push!(visited, copy(initial_sigma))
+    feasible = [copy(initial_sigma)]
+    queue    = [copy(initial_sigma)]
+
+    while !isempty(queue)
+        sigma = popfirst!(queue)
+        for i in 1:n_conds
+            sigma2    = copy(sigma)
+            sigma2[i] = 1 - sigma2[i]
+            sigma2 in visited && continue
+            push!(visited, copy(sigma2))
+            if is_feasible(sigma2, cond_eff_lhs, cond_is_strict, n_atoms, eps)
+                push!(feasible, copy(sigma2))
+                push!(queue, copy(sigma2))
+            end
+        end
+    end
+
+    @printf(stderr, "  EBE: %d feasible region(s)  (%d sign patterns visited via BFS)\n",
+            length(feasible), length(visited))
+
+    filter_degenerate(feasible, cond_eff_lhs, cond_is_strict, n_conds)
 end
 
 # ---------------------------------------------------------------------------
@@ -125,13 +260,9 @@ end
 Run Phase 3 DB check over all chambers.
 
 Key optimisations:
-  1. Pre-compute which Case applies to each unique weight once per chamber
-     (n_chambers × n_weights lookups instead of one per pair-leaf).
+  1. Pre-compute which Case applies to each unique weight once per chamber.
   2. Group by integer coefficient vector (v_coeffs + energy_coeffs) rather
-     than by the Rational dot-product value.  The grouping is algebraically
-     exact: two terms belong to the same Boltzmann class iff their combined
-     integer coefficient vector is identical for all J.  This eliminates all
-     BigInt arithmetic from Phase 3.
+     than by the Rational dot-product value.  Algebraically exact; no BigInt.
 
 Returns (pass::Bool, violations::Vector{Tuple{Int,Int,Int}}).
 """
@@ -151,13 +282,10 @@ function run_phase3(
     violations = Tuple{Int,Int,Int}[]
     groups     = Dict{Vector{Int64}, Rational{Int64}}()
 
-    # Per-chamber buffer: active terms for each unique weight
     active_terms = Vector{Vector{Term}}(undef, n_weights)
-    # Reusable key buffer (avoids allocation in hot loop)
     key_buf      = Vector{Int64}(undef, n_atoms)
 
     for (reg_idx, sigma) in enumerate(feasible_sigmas)
-        # Pre-compute which terms are active for each unique weight this chamber.
         for wi in 1:n_weights
             active_terms[wi] = get_terms(unique_weights[wi], sigma)
         end
@@ -170,7 +298,6 @@ function run_phase3(
             ei   = state_energy_coeffs[i]
             ej   = state_energy_coeffs[j]
 
-            # T(i→j) × Exp(-β·E_i): add contributions
             for leaf_idx in pair_ij_srcs[p]
                 for term in active_terms[leaf_weight_idx[leaf_idx]]
                     iszero(term.c_num) && continue
@@ -181,7 +308,6 @@ function run_phase3(
                 end
             end
 
-            # T(j→i) × Exp(-β·E_j): subtract contributions
             for leaf_idx in pair_ji_srcs[p]
                 for term in active_terms[leaf_weight_idx[leaf_idx]]
                     iszero(term.c_num) && continue
@@ -192,7 +318,6 @@ function run_phase3(
                 end
             end
 
-            # Check all group coefficients are zero
             for coeff in values(groups)
                 if !iszero(coeff)
                     push!(violations, (i, j, reg_idx))
@@ -217,12 +342,26 @@ function main()
 
     t_load = @elapsed begin
         (n_atoms, n_conds, n_states, n_pairs, n_leaves,
+         cond_eff_lhs, cond_is_strict, initial_sigma,
          state_energy_coeffs, feasible_sigmas,
          unique_weights, leaf_weight_idx,
          pair_states, pair_ij_srcs, pair_ji_srcs) = load_compact(ARGS[1])
     end
-    @printf(stderr, "Load: %.2fs  (%d conds, %d states, %d pairs, %d leaves, %d unique weights, %d chambers)\n",
-            t_load, n_conds, n_states, n_pairs, n_leaves, length(unique_weights), length(feasible_sigmas))
+    @printf(stderr, "Load: %.2fs  (%d conds, %d states, %d pairs, %d leaves, %d unique weights)\n",
+            t_load, n_conds, n_states, n_pairs, n_leaves, length(unique_weights))
+
+    # Phase 2: enumerate chambers via HiGHS LP BFS (if not precomputed)
+    t_p2 = 0.0
+    if isempty(feasible_sigmas)
+        t_p2 = @elapsed begin
+            feasible_sigmas = run_phase2(initial_sigma, cond_eff_lhs, cond_is_strict,
+                                         n_atoms, n_conds)
+        end
+        @printf(stderr, "Phase 2: %.3fs  (%d genuine chambers)\n", t_p2, length(feasible_sigmas))
+    else
+        @printf(stderr, "Phase 2: skipped (using %d precomputed chambers)\n",
+                length(feasible_sigmas))
+    end
 
     # Phase 3: DB check
     t_p3 = @elapsed begin
