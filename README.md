@@ -89,6 +89,86 @@ When the `-julia` flag is used, EBE delegates both chamber enumeration and the D
 
 ---
 
+## Pure-Julia checker (no Mathematica)
+
+The `-julia` flag described above only delegates **EBE Phase 2+3** to Julia; the τ-BFS (Phase 1) and all orchestration still run in Mathematica. A separate **fully Julia-native checker** runs the *entire* pipeline — state enumeration, τ-BFS, ergodicity, and detailed balance — in Julia with **zero Mathematica dependency**.
+
+Because Julia has no equivalent of Mathematica's `Block`-based dynamic RNG interception, algorithms **cannot be read from `.wl` files**. Each algorithm is hand-translated to a Julia file in `j_examples/` using the checker's random primitives. (`vmmc_2d` is intentionally not translated yet.)
+
+### Running
+
+```
+julia --project=julia_poc julia_poc/check.jl j_examples/single_metropolis.jl
+```
+
+Options: `-maxdepth N` (BFS bit-depth limit, default 22).
+
+Run the regression suite (proven unit pieces + fast PASS/FAIL end-to-end checks):
+
+```
+julia --project=julia_poc julia_poc/test_dbc.jl
+```
+
+### Algorithm file format (`j_examples/*.jl`)
+
+```julia
+const NGRID          = 3
+const MAXD2          = 2
+const PARTICLE_TYPES = [1, 2, 3]
+const SYMMETRY_GROUP = ["translation"]
+
+energy(state::PState)::LinForm = ...           # symbolic energy, linear in atoms
+algorithm(rng, state::PState)::PState = ...     # one MCMC step, using rng primitives
+```
+
+Positions are `TauNum` (τ-tracked) coordinates inside a `Particle(r, c, type)`. Translations of `examples/*.wl` use only the provided helpers:
+
+| Helper | Mirrors |
+|---|---|
+| `rand_choice!(rng, list)` / `rand_choice_index!(rng, n)` | `RandomChoice[list]` (exact `1/n` rejection-sampling weight) |
+| `rand_integer!(rng, lo, hi)` | `RandomInteger[{lo,hi}]` |
+| `metropolis!(rng, dE; exponent=dE)` | `RandomReal[] < Piecewise[{{1, dE<=0}}, Exp[-β·exponent]]` |
+| `pbc_d2(p, q, n)` / `same_site(p, q, n)` / `pmod(x, n)` | minimum-image distance² / occupancy / `Mod` (all τ-checked) |
+| `Jc(a, b, d2)` / `Xparam(:fieldH)` | `couplingJ[a,b,d2]` (canonicalised `a≤b`) / a field-like parameter |
+
+### Why it is sound
+
+- **τ-tracking.** Every coordinate carries an exact linear form `v + cr·τr + cc·τc` plus a *taint* flag for any nonlinear term (`τr²`, `τr·τc`, …). A value is translation-invariant iff it is τ-free (`cr=cc=0`, not tainted). Pairwise differences cancel τ exactly; an absolute-position energy (e.g. the quadratic field's `row²`) taints, and a `Mod`/comparison on a τ-dependent value is flagged. This is exact, not numerical.
+- **Direct transition matrix.** The τ-augmented BFS runs from **every** state (no orbit reduction), so the transition matrix is built directly and the τ-check covers all states. At `τ=0` the augmented run reproduces the real lattice algorithm exactly, so the DB matrix is always correct **regardless of the τ verdict** (this is why `quadratic_field` is τ FAIL but DB PASS).
+- **Exact detailed balance.** Leaf weights are stored symbolically (a rational coefficient × clamped-Boltzmann accept/reject factors), never as floats. Chambers of the coupling-parameter hyperplane arrangement are enumerated by a HiGHS LP BFS (non-strict negation + degenerate-boundary filter, identical to the Mathematica `-julia` path). Within each chamber the DB residual is grouped by **exact rational** exponent vector (`Rational{BigInt}`) and each group is checked to sum to zero. This handles half-integer Boltzmann exponents (`broken_metropolis_halfbeta`, `exp(-β·dE/2)`) directly, where the Mathematica integer-key path falls back.
+
+### Fail-loud guarantees
+
+A false PASS (DB satisfied when it is not) is the most dangerous outcome, so the checker **aborts with an error** rather than return a possibly-wrong verdict whenever it meets something it cannot represent exactly:
+
+- `"D4"` declared in `SYMMETRY_GROUP` — the Julia checker is translation-only; it errors rather than silently ignoring D4.
+- A BFS path exceeds `maxdepth` — an incomplete tree would drop transitions; treated as fatal (raise `-maxdepth`).
+- A non-integer position coordinate, an inverted `RandomInteger` range, or any RNG form not in the supported set above.
+
+### Documented edge cases / limitations
+
+- **τ-coverage is exact only for values that flow through the typed API.** The detection is sound for any quantity built from `TauNum` arithmetic and the geometry helpers. A translation that bypasses the API — e.g. extracts `tau0(p.r)` early and branches on the raw integer — hides that τ-dependence from the checker. Translations must keep positions as `TauNum` until after any τ-sensitive operation; this is the contract (and the reason translations are reviewed, not auto-generated).
+- A translation-covariant next-state position (one that shifts *with* the lattice) is correctly **not** flagged — only τ-dependence in a **weight or branch** is a violation.
+- Only the random primitives exercised by the examples are implemented; anything else raises a hard error.
+- `vmmc_2d` is not yet translated (large, multi-step cluster algorithm).
+
+### Verified examples (`j_examples/`, all match the Mathematica verdicts)
+
+| File | Translational | Detailed balance | Ergodicity | Chambers |
+|---|---|---|---|---|
+| `single_metropolis.jl` | PASS | PASS | PASS | 48 |
+| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 6 |
+| `quadratic_field.jl` | **FAIL** (absolute-position field) | PASS | PASS | 6 |
+| `broken_variable_pool.jl` | PASS | **FAIL** (pool size 3 vs 4) | PASS | 1 |
+| `broken_8way_hop.jl` | PASS | **FAIL** (pool size 7 vs 8) | PASS | 1 |
+| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated direction) | PASS | 48 |
+| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`; exact-rational exponents) | PASS | 48 |
+| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 2 |
+
+The `single_metropolis` chamber count (48) matches the Mathematica `-julia` path exactly. Each example runs in a few seconds (the τ-augmented BFS visits every state, which is the dominant cost at these system sizes).
+
+---
+
 ## Algorithm file format
 
 ```mathematica
