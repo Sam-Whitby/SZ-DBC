@@ -93,15 +93,20 @@ When the `-julia` flag is used, EBE delegates both chamber enumeration and the D
 
 The `-julia` flag described above only delegates **EBE Phase 2+3** to Julia; the τ-BFS (Phase 1) and all orchestration still run in Mathematica. A separate **fully Julia-native checker** runs the *entire* pipeline — state enumeration, τ-BFS, ergodicity, and detailed balance — in Julia with **zero Mathematica dependency**.
 
-Because Julia has no equivalent of Mathematica's `Block`-based dynamic RNG interception, algorithms **cannot be read from `.wl` files**. Each algorithm is hand-translated to a Julia file in `j_examples/` using the checker's random primitives. (`vmmc_2d` is intentionally not translated yet.)
+Because Julia has no equivalent of Mathematica's `Block`-based dynamic RNG interception, algorithms **cannot be read from `.wl` files**. Each algorithm is hand-translated to a Julia file in `j_examples/` using the checker's random primitives. All nine examples — including a **faithful translation of `vmmc_2d`** — are provided.
+
+> A standalone, cleaned-up version of this checker lives in its own repository, **[DB_Julia](https://github.com/Sam-Whitby/DB_Julia)** (Julia-only, no Mathematica references, no symmetry declarations, with extensive time-profiling in its README). The `julia_poc/` copy here shares the same engine.
+
+The weight engine is **fully symbolic and exact**: leaf weights are products of symbolic thresholds (`ThExpr`) evaluated per coupling-parameter chamber to exact rational functions of exponentials (`Val = numerator / ∏(1−exp) binomials`). This lets it verify VMMC's Whitelam–Geissler frustration test **faithfully** — its `r1`/`r2` acceptance produces a ratio `(1−exp)/(1−exp)` capped by `Min`, which only cancels after the two factors multiply; the detailed-balance check clears denominators so the residual is an exact polynomial. Half-integer Boltzmann exponents (`exp(−β·dE/2)`) are handled directly.
 
 ### Running
 
 ```
 julia --project=julia_poc julia_poc/check.jl j_examples/single_metropolis.jl
+julia --project=julia_poc julia_poc/check.jl j_examples/vmmc_2d.jl
 ```
 
-Options: `-maxdepth N` (BFS bit-depth limit, default 22).
+Options: `-maxdepth N` (BFS bit-depth limit, default 30).
 
 Run the regression suite (proven unit pieces + fast PASS/FAIL end-to-end checks):
 
@@ -154,18 +159,21 @@ A false PASS (DB satisfied when it is not) is the most dangerous outcome, so the
 
 ### Verified examples (`j_examples/`, all match the Mathematica verdicts)
 
-| File | Translational | Detailed balance | Ergodicity | Chambers |
-|---|---|---|---|---|
-| `single_metropolis.jl` | PASS | PASS | PASS | 48 |
-| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 6 |
-| `quadratic_field.jl` | **FAIL** (absolute-position field) | PASS | PASS | 6 |
-| `broken_variable_pool.jl` | PASS | **FAIL** (pool size 3 vs 4) | PASS | 1 |
-| `broken_8way_hop.jl` | PASS | **FAIL** (pool size 7 vs 8) | PASS | 1 |
-| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated direction) | PASS | 48 |
-| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`; exact-rational exponents) | PASS | 48 |
-| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 2 |
+Times are wall-clock for a single `check.jl` run (including ~4–5 s of Julia JIT warmup per process).
 
-The `single_metropolis` chamber count (48) matches the Mathematica `-julia` path exactly. Each example runs in a few seconds (the τ-augmented BFS visits every state, which is the dominant cost at these system sizes).
+| File | Translational | Detailed balance | Ergodicity | Chambers | Time |
+|---|---|---|---|---|---|
+| `single_metropolis.jl` | PASS | PASS | PASS | 48 | 10.9 s |
+| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 6 | 9.2 s |
+| `quadratic_field.jl` | **FAIL** (absolute-position field) | PASS | PASS | 6 | 9.2 s |
+| `broken_variable_pool.jl` | PASS | **FAIL** (pool size 3 vs 4) | PASS | 1 | 6.6 s |
+| `broken_8way_hop.jl` | PASS | **FAIL** (pool size 7 vs 8) | PASS | 1 | 5.7 s |
+| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated direction) | PASS | 48 | 10.5 s |
+| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`; exact-rational exponents) | PASS | 48 | 10.4 s |
+| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 2 | 8.2 s |
+| `vmmc_2d.jl` | PASS | PASS | PASS | **216** | 26.4 s |
+
+The chamber counts match the Mathematica path exactly (`single_metropolis` → 48, `vmmc_2d` → 216). Profiling-driven optimisations (per-pair condition projection, lazy weight caching, translation-orbit reduction, threshold hash-consing) took VMMC from **355 s to ~26 s** with the result unchanged; see the [DB_Julia README](https://github.com/Sam-Whitby/DB_Julia) for the full per-phase breakdown.
 
 ---
 

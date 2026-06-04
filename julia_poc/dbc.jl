@@ -223,22 +223,151 @@ const _TAU     = Ref(false)
 const _TAU_MSG = Ref("")
 tau_violation!(msg::String) = (_TAU[] = true; _TAU_MSG[] = msg; nothing)
 
-# One Metropolis accept/reject factor:
-#   threshold = Piecewise[{{1, cond_lhs <= 0}}, exp(-beta * expo)]
-#   accept branch contributes the threshold; reject branch 1 - threshold.
-struct MFactor
-    cond::RatForm     # cond_lhs (the clamp condition is cond_lhs <= 0)
-    expo::RatForm     # Boltzmann exponent g
+# ----------------------------------------------------------------------------
+# Exact rational functions of exp-monomials (BSum / Val)
+# ----------------------------------------------------------------------------
+# A threshold's value in a fixed chamber is a sum  c * exp(-beta * (L . J)).  For
+# VMMC's frustration test the value is a RATIO of such sums (the ratio cancels
+# only after the two acceptance factors are multiplied), so we carry values as
+#     Val = num / prod_k (1 - exp(-beta * L_k))
+# with `num` a Laurent polynomial in the exp-monomials (BSum) and `den` a
+# multiset of binomials (1 - exp(-beta*L_k)).  Denominators are only ever
+# products of such binomials, so the representation is closed and the DB check
+# clears denominators exactly (the residual is a plain polynomial).
+const ExpVec = Vector{Q}                  # exponent L over the global atom list
+const BSum   = Dict{ExpVec, Q}            # sum_L coeff * exp(-beta * (L.J))
+
+function bs_add!(s::BSum, L::ExpVec, c::Q)
+    c == 0 && return s
+    v = get(s, L, Q(0)) + c
+    v == 0 ? delete!(s, L) : (s[L] = v); s
+end
+bs_const(c::Q, nA::Int) = c == 0 ? BSum() : BSum(zeros(Q, nA) => c)
+bs_addsum(a::BSum, b::BSum) = (r = copy(a); for (L,c) in b; bs_add!(r,L,c); end; r)
+bs_sub(a::BSum, b::BSum)    = (r = copy(a); for (L,c) in b; bs_add!(r,L,-c); end; r)
+function bs_mul(a::BSum, b::BSum)
+    r = BSum()
+    for (La,ca) in a, (Lb,cb) in b; bs_add!(r, La .+ Lb, ca*cb); end
+    r
+end
+bs_shift(a::BSum, E::ExpVec) = BSum((L .+ E) => c for (L,c) in a)
+
+struct Val
+    num::BSum
+    den::Vector{ExpVec}       # multiset of L_k ; den = prod (1 - exp(-beta*L_k))
+end
+val_const(c::Q, nA::Int) = Val(bs_const(c, nA), ExpVec[])
+val_boltz(L::ExpVec)     = Val(BSum(copy(L) => Q(1)), ExpVec[])    # exp(-beta*L)
+val_mul(a::Val, b::Val)  = Val(bs_mul(a.num, b.num), vcat(a.den, b.den))
+
+function expand_binoms(dens::Vector{ExpVec}, nA::Int)
+    acc = bs_const(Q(1), nA)
+    for L in dens
+        acc = bs_mul(acc, BSum(zeros(Q,nA) => Q(1), copy(L) => Q(-1)))
+    end
+    acc
+end
+val_oneminus(v::Val, nA::Int) = Val(bs_sub(expand_binoms(v.den, nA), v.num), copy(v.den))
+
+function ms_unionmax(a::Vector{ExpVec}, b::Vector{ExpVec})
+    cnt = Dict{ExpVec,Int}()
+    for L in a; cnt[L] = max(get(cnt,L,0), count(==(L), a)); end
+    for L in b; cnt[L] = max(get(cnt,L,0), count(==(L), b)); end
+    out = ExpVec[]; for (L,k) in cnt, _ in 1:k; push!(out,L); end; out
+end
+function ms_diff(big::Vector{ExpVec}, small::Vector{ExpVec})
+    rem = copy(big)
+    for L in small
+        i = findfirst(==(L), rem); i === nothing && cant("denominator multiset diff failed"); deleteat!(rem, i)
+    end
+    rem
+end
+
+# ----------------------------------------------------------------------------
+# Conditions and symbolic thresholds (ThExpr)
+# ----------------------------------------------------------------------------
+# A condition is a linear inequality on the couplings:  lhs (op) 0,  op being
+# `<` (strict) or `<=` (non-strict).  It is TRUE in chambers where that holds.
+struct Cond
+    lhs::RatForm
+    strict::Bool        # true: lhs < 0 ; false: lhs <= 0
+end
+# Canonical hashable key for a RatForm (sorted (atom,coeff) pairs).
+_form_key(f::RatForm) = Tuple(sort([(a, v) for (a, v) in f]))
+cond_key(c::Cond) = (_form_key(c.lhs), c.strict)
+
+# Subtraction of two energy forms (RatForm).
+function rf_sub(a::RatForm, b::RatForm)::RatForm
+    r = copy(a); for (k,v) in b; nv = get(r,k,Q(0))-v; nv==0 ? delete!(r,k) : (r[k]=nv); end; r
+end
+# Flag a tau-violation if an energy form is tau-dependent, then drop tau.
+tau0_checked(lf::LinForm)::RatForm =
+    (any_tau_dep(lf) && tau_violation!("a threshold/condition depends on an absolute (tau-dependent) position"); tau0_form(lf))
+
+abstract type ThExpr end
+struct ThConst <: ThExpr; c::Q; end
+struct ThBoltz <: ThExpr; L::RatForm; end                 # exp(-beta * L)
+struct ThOp    <: ThExpr; op::Symbol; a::ThExpr; b::ThExpr; end   # :+,:-,:*,:/
+struct ThMin   <: ThExpr; a::ThExpr; b::ThExpr; end
+struct ThPiece <: ThExpr; clauses::Vector{Tuple{Vector{Cond},ThExpr}}; default::ThExpr; end
+
+# Hash-consing (interning): structurally-equal thresholds share ONE object, so
+# the millions of thresholds built during the BFS collapse to a few thousand
+# canonical nodes. This makes weight-deduplication an objectid comparison
+# instead of a deep structural hash (the dominant cost otherwise). Keys are
+# built from already-interned children by objectid, so they stay small.
+const _TH_CACHE = Dict{Any,ThExpr}()
+reset_th_cache!() = empty!(_TH_CACHE)
+_intern(make::Function, key) = get!(make, _TH_CACHE, key)   # `_intern(key) do ... end`
+
+# Translation-facing builders (energies are LinForm so tau is tracked).
+th_const(x)                 = _intern((:c, Q(x))) do; ThConst(Q(x)) end
+th_boltz(L::LinForm)        = (rl = tau0_checked(L); _intern((:b, _form_key(rl))) do; ThBoltz(rl) end)
+th_add(a::ThExpr,b::ThExpr) = _intern((:op,:+,objectid(a),objectid(b))) do; ThOp(:+,a,b) end
+th_sub(a::ThExpr,b::ThExpr) = _intern((:op,:-,objectid(a),objectid(b))) do; ThOp(:-,a,b) end
+th_mul(a::ThExpr,b::ThExpr) = _intern((:op,:*,objectid(a),objectid(b))) do; ThOp(:*,a,b) end
+th_div(a::ThExpr,b::ThExpr) = _intern((:op,:/,objectid(a),objectid(b))) do; ThOp(:/,a,b) end
+th_min(a::ThExpr,b::ThExpr) = _intern((:min,objectid(a),objectid(b))) do; ThMin(a,b) end
+c_lt(a::LinForm,b::LinForm) = Cond(tau0_checked(linsub(a,b)), true)   # a < b
+c_le(a::LinForm)            = Cond(tau0_checked(a), false)            # a <= 0
+
+# A condition on an identically-zero form is constant:  0<0 is always False,
+# 0<=0 is always True.  Such guards are resolved at construction so degenerate
+# clauses (e.g. a VMMC link where the two distances coincide, making eInit==eFwd
+# and the ratio denominator structurally zero) are pruned before evaluation.
+is_const_false(c::Cond) = isempty(c.lhs) &&  c.strict
+is_const_true(c::Cond)  = isempty(c.lhs) && !c.strict
+
+# Build a Piecewise threshold, pruning clauses whose guard can never hold and
+# dropping always-true guards.  A clause whose guard becomes empty always fires,
+# so later clauses are unreachable.
+function th_piece(clauses, default)
+    kept = Tuple{Vector{Cond},ThExpr}[]
+    for (guards, val) in clauses
+        any(is_const_false, guards) && continue
+        g2 = Cond[g for g in guards if !is_const_true(g)]
+        push!(kept, (g2, val))
+        isempty(g2) && break                            # always fires; rest dead
+    end
+    key = (:pw, Tuple((Tuple(cond_key(g) for g in gs), objectid(v)) for (gs,v) in kept), objectid(default))
+    _intern(key) do; ThPiece(kept, default) end
+end
+
+to_vec(rf::RatForm, aidx::Dict{Atom,Int}, nA::Int) =
+    (v = zeros(Q, nA); for (a,c) in rf; v[aidx[a]] = c; end; v)
+
+struct ThFactor
+    thr::ThExpr
     accepted::Bool
 end
 
 mutable struct BitSeqRNG
     bits::Vector{Int}
     pos::Int
-    coeff::Q                  # rational selection-probability product
-    factors::Vector{MFactor}  # symbolic acceptance factors, in order
+    coeff::Q                    # rational selection-probability product
+    factors::Vector{ThFactor}   # symbolic acceptance factors, in order
 end
-BitSeqRNG(bits::Vector{Int}) = BitSeqRNG(bits, 0, Q(1), MFactor[])
+BitSeqRNG(bits::Vector{Int}) = BitSeqRNG(bits, 0, Q(1), ThFactor[])
 
 function read_bit!(rng::BitSeqRNG)::Int
     rng.pos += 1
@@ -246,13 +375,8 @@ function read_bit!(rng::BitSeqRNG)::Int
     rng.coeff *= 1 // 2
     rng.bits[rng.pos]
 end
-
 function read_bits_int!(rng::BitSeqRNG, k::Int)::Int
-    acc = 0
-    for _ in 1:k
-        acc = acc * 2 + read_bit!(rng)
-    end
-    acc
+    acc = 0; for _ in 1:k; acc = acc*2 + read_bit!(rng); end; acc
 end
 
 # Bits needed to index 0..n-1, matching Mathematica IntegerLength[n-1, 2].
@@ -265,10 +389,9 @@ function rand_choice_index!(rng::BitSeqRNG, n::Int)::Int
     k   = nbits(n)
     val = read_bits_int!(rng, k)
     val >= n && throw(OutOfRangeException())
-    rng.coeff *= Q(2)^k // n          # undo the (1/2)^k from read_bit!, leave 1/n
+    rng.coeff *= Q(2)^k // n
     val + 1
 end
-
 rand_choice!(rng::BitSeqRNG, list::AbstractVector) = list[rand_choice_index!(rng, length(list))]
 
 # RandomInteger[{lo, hi}] with exact rejection sampling.
@@ -283,24 +406,24 @@ function rand_integer!(rng::BitSeqRNG, lo::Int, hi::Int)::Int
     lo + val
 end
 
-# Metropolis acceptance: mirrors  RandomReal[] < Piecewise[{{1, dE<=0}}, exp(-beta*exponent)].
-# Always reads exactly one bit (always-read policy) so the symbolic decision
-# tree matches Mathematica's; the symbolic factor is recorded, not evaluated.
-# `exponent` defaults to dE (standard Metropolis); pass a scaled form for
-# variants such as exp(-beta*dE/2).
-function metropolis!(rng::BitSeqRNG, dE::LinForm; exponent::LinForm = dE)::Bool
-    (any_tau_dep(dE) || any_tau_dep(exponent)) &&
-        tau_violation!("acceptance threshold depends on an absolute (tau-dependent) position")
-    cond = tau0_form(dE)
-    expo = tau0_form(exponent)
-    # dE identically 0  =>  clamp condition 0<=0 is True  =>  threshold 1  =>
-    # always accept with no bit (matches acceptTestI's pVal>=hi shortcut).
-    isempty(cond) && return true
+# General acceptance test: mirrors  RandomReal[] < thr  for an arbitrary symbolic
+# threshold.  Always reads one bit (always-read policy); the symbolic factor is
+# recorded (thr on accept, 1-thr on reject) for exact downstream evaluation.
+function accept!(rng::BitSeqRNG, thr::ThExpr)::Bool
     rng.pos += 1
     rng.pos > length(rng.bits) && throw(OutOfBitsException())
     accepted = rng.bits[rng.pos] == 1
-    push!(rng.factors, MFactor(cond, expo, accepted))
+    push!(rng.factors, ThFactor(thr, accepted))
     accepted
+end
+
+# Metropolis acceptance: RandomReal[] < Piecewise[{{1, dE<=0}}, exp(-beta*exponent)].
+function metropolis!(rng::BitSeqRNG, dE::LinForm; exponent::LinForm = dE)::Bool
+    (any_tau_dep(dE) || any_tau_dep(exponent)) &&
+        tau_violation!("acceptance threshold depends on an absolute (tau-dependent) position")
+    # dE identically 0  =>  threshold 1  =>  always accept, no bit.
+    isempty(tau0_form(dE)) && return true
+    accept!(rng, th_piece([([c_le(dE)], th_const(1))], th_boltz(exponent)))
 end
 
 # ============================================================================
@@ -326,7 +449,7 @@ end
 struct Leaf
     next::CState
     coeff::Q
-    factors::Vector{MFactor}
+    factors::Vector{ThFactor}
 end
 
 # Exhaustive BFS over all bit strings for one (tau-augmented) seed state.
@@ -359,17 +482,29 @@ function build_state_leaves(algo, seed::PState, n::Int, maxdepth::Int)::Vector{L
     leaves
 end
 
-# ---- concrete evaluation of a leaf weight (sanity testing only) ----
-# Threshold value of a factor at concrete couplings J (Float64) and beta.
-function _eval_factor(f::MFactor, J::Dict{Atom,Float64}, beta::Float64)::Float64
-    dE = sum(Float64(v) * get(J, a, 0.0) for (a, v) in f.cond; init = 0.0)
-    g  = sum(Float64(v) * get(J, a, 0.0) for (a, v) in f.expo; init = 0.0)
-    th = dE <= 0 ? 1.0 : exp(-beta * g)
-    f.accepted ? th : (1.0 - th)
+# ---- concrete float evaluation of a leaf weight (sanity testing only) ----
+_rfval(rf::RatForm, J::Dict{Atom,Float64}) = sum(Float64(v)*get(J,a,0.0) for (a,v) in rf; init=0.0)
+_guard_true(c::Cond, J) = c.strict ? _rfval(c.lhs,J) < 0 : _rfval(c.lhs,J) <= 0
+function eval_th_float(t::ThExpr, J::Dict{Atom,Float64}, beta::Float64)::Float64
+    if t isa ThConst; Float64(t.c)
+    elseif t isa ThBoltz; exp(-beta * _rfval(t.L, J))
+    elseif t isa ThOp
+        a = eval_th_float(t.a,J,beta); b = eval_th_float(t.b,J,beta)
+        t.op === :+ ? a+b : t.op === :- ? a-b : t.op === :* ? a*b : a/b
+    elseif t isa ThMin; min(eval_th_float(t.a,J,beta), eval_th_float(t.b,J,beta))
+    else  # ThPiece
+        for (guards,val) in t.clauses
+            all(_guard_true(g,J) for g in guards) && return eval_th_float(val,J,beta)
+        end
+        eval_th_float(t.default,J,beta)
+    end
 end
 function eval_leaf(lf::Leaf, J::Dict{Atom,Float64}, beta::Float64)::Float64
     w = Float64(lf.coeff)
-    for f in lf.factors; w *= _eval_factor(f, J, beta); end
+    for f in lf.factors
+        th = eval_th_float(f.thr, J, beta)
+        w *= f.accepted ? th : (1.0 - th)
+    end
     w
 end
 
@@ -431,41 +566,99 @@ concrete_pstate(cs::CState)::PState = PState([Particle(TauNum(r), TauNum(c), t) 
 augmented_pstate(cs::CState)::PState = PState([aug_particle(r, c, t) for (r, c, t) in cs])
 
 # ============================================================================
-# SECTION 6 — T-matrix build (per-state BFS) + ergodicity reachability
+# SECTION 6 — Transition build (translation-orbit reduction) + ergodicity
 # ============================================================================
-# Runs the tau-augmented BFS from EVERY state (no orbit reduction), so the
-# transition matrix is built directly and the tau-check covers all states.
+# A translation-invariant algorithm has a translation-EQUIVARIANT transition
+# matrix, so we BFS only one representative per translation orbit (~nGrid^2 fewer
+# BFS runs) and obtain every other state's transitions by translating the rep's
+# leaves. The leaf WEIGHTS are translation-invariant (they depend on types and
+# pairwise distances, not absolute positions), so all states in an orbit share
+# the same symbolic weights — the unique-weight set comes from the reps alone.
+#
+# This reduction is valid ONLY when translation invariance holds. If the tau-BFS
+# from a rep flags a violation, we fall back to a direct BFS from EVERY state
+# (no equivariance assumed), which is correct for any algorithm.
+
+# Translate a concrete state by (dr,dc) on the n-torus.
+translate_cstate(cs::CState, dr::Int, dc::Int, n::Int)::CState =
+    sort(NTuple{3,Int}[(mod(r-1+dr,n)+1, mod(c-1+dc,n)+1, t) for (r,c,t) in cs])
+
+# Partition states into translation orbits. Returns the reps and, per state,
+# (rep, (dr,dc)) such that translate(rep, dr,dc) == state.
+function translation_orbits(states::Vector{CState}, n::Int)
+    repof = Dict{CState,CState}(); gof = Dict{CState,Tuple{Int,Int}}(); reps = CState[]
+    for cs in states
+        haskey(repof, cs) && continue
+        orbit = Dict{CState,Tuple{Int,Int}}()
+        for dr in 0:n-1, dc in 0:n-1
+            t = translate_cstate(cs, dr, dc, n)
+            haskey(orbit, t) || (orbit[t] = (dr, dc))
+        end
+        rep = minimum(keys(orbit)); grep = orbit[rep]; push!(reps, rep)
+        for (t, gt) in orbit
+            repof[t] = rep
+            gof[t] = (mod(gt[1]-grep[1], n), mod(gt[2]-grep[2], n))  # translate(rep,g)=t
+        end
+    end
+    reps, repof, gof
+end
+
 struct BFSResult
-    states        :: Vector{CState}
-    idx           :: Dict{CState,Int}
-    leaves        :: Vector{Vector{Leaf}}   # leaves[i] = leaves from state i
-    tau_free      :: Bool
-    tau_msg       :: String
+    states   :: Vector{CState}
+    idx      :: Dict{CState,Int}
+    uweights :: Vector{Leaf}                 # unique (representative) leaf weights
+    trans    :: Vector{Tuple{Int,Int,Int}}   # (src, dst, weight-index), src != dst
+    tau_free :: Bool
+    tau_msg  :: String
 end
 
 function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdepth::Int)::BFSResult
+    reset_th_cache!()                       # fresh interning table for this run
     idx = Dict(cs => i for (i, cs) in enumerate(states))
-    leaves = Vector{Vector{Leaf}}(undef, length(states))
+    uweights = Leaf[]; uw_idx = Dict{Any,Int}()
+    widx!(lf::Leaf) = get!(uw_idx, _weight_key(lf)) do; push!(uweights, lf); length(uweights) end
+    trans = Tuple{Int,Int,Int}[]
     tau_free = true; tau_msg = ""
-    for (i, cs) in enumerate(states)
+
+    reps, repof, gof = translation_orbits(states, n)
+    rep_leaves = Dict{CState,Vector{Leaf}}()
+    for rep in reps
         _TAU[] = false; _TAU_MSG[] = ""
-        leaves[i] = build_state_leaves(algo, augmented_pstate(cs), n, maxdepth)
-        if _TAU[]
-            tau_free = false
-            isempty(tau_msg) && (tau_msg = _TAU_MSG[])
+        rep_leaves[rep] = build_state_leaves(algo, augmented_pstate(rep), n, maxdepth)
+        if _TAU[]; tau_free = false; isempty(tau_msg) && (tau_msg = _TAU_MSG[]); end
+    end
+
+    if tau_free
+        # Dedup the rep leaves' weights ONCE (by object identity in the orbit
+        # expansion below), then translate each rep leaf to every orbit member.
+        wi_of = IdDict{Leaf,Int}()
+        for rep in reps, lf in rep_leaves[rep]; wi_of[lf] = widx!(lf); end
+        for (s, si) in idx
+            rep = repof[s]; (dr, dc) = gof[s]
+            for lf in rep_leaves[rep]
+                dst = idx[translate_cstate(lf.next, dr, dc, n)]
+                dst != si && push!(trans, (si, dst, wi_of[lf]))
+            end
+        end
+    else
+        # Fallback: direct BFS from every state (no equivariance assumed).
+        for (s, si) in idx
+            lvs = haskey(rep_leaves, s) ? rep_leaves[s] :
+                  build_state_leaves(algo, augmented_pstate(s), n, maxdepth)
+            for lf in lvs
+                wi = widx!(lf); dst = idx[lf.next]
+                dst != si && push!(trans, (si, dst, wi))
+            end
         end
     end
-    BFSResult(states, idx, leaves, tau_free, tau_msg)
+    BFSResult(states, idx, uweights, trans, tau_free, tau_msg)
 end
 
 # Reachability ergodicity: BFS over the directed transition graph from the seed.
 function check_ergodicity(bfs::BFSResult, seed::CState)
     nS = length(bfs.states)
     adj = [Set{Int}() for _ in 1:nS]
-    for i in 1:nS, lf in bfs.leaves[i]
-        j = bfs.idx[lf.next]
-        j != i && push!(adj[i], j)
-    end
+    for (s, d, _) in bfs.trans; push!(adj[s], d); end
     seedi = bfs.idx[seed]
     seen = Set{Int}([seedi]); queue = [seedi]
     while !isempty(queue)
@@ -478,153 +671,196 @@ function check_ergodicity(bfs::BFSResult, seed::CState)
 end
 
 # ============================================================================
-# SECTION 7 — Detailed-balance check (compact structure + Phase 2 + Phase 3)
+# SECTION 7 — Detailed-balance check (conditions, chambers, exact residual)
 # ============================================================================
-# Mirrors dbc_core.wl's $dbcExportCompact + julia_poc/ebe.jl, but built fully
-# in-memory and generalised to EXACT rationals (Rational{BigInt}) throughout,
-# so half-integer Boltzmann exponents (e.g. exp(-beta*dE/2)) are handled exactly
-# instead of triggering a Mathematica fallback.
+# The leaf weights are products of symbolic acceptance factors (ThExpr). The
+# branch CONDITIONS (linear inequalities on the couplings) carve coupling space
+# into chambers; within each chamber every factor resolves to an exact rational
+# function of exp-monomials (a Val). For each communicating pair the detailed-
+# balance residual is formed and its denominators cleared, leaving a polynomial
+# whose coefficients must all vanish — checked exactly with Rational{BigInt}.
 
 using HiGHS
 
-# Canonical hashable key for a RatForm (sorted (atom,coeff) pairs).
-_form_key(f::RatForm) = Tuple(sort([(a, v) for (a, v) in f]))
-# Canonical hashable key for a whole leaf weight (coeff + ordered factors).
-_weight_key(lf::Leaf) =
-    (lf.coeff, Tuple((_form_key(f.cond), _form_key(f.expo), f.accepted) for f in lf.factors))
+# Unique-weight key: thresholds are interned (hash-consed), so structurally
+# equal thresholds are the SAME object and objectid identifies them in O(1).
+_weight_key(lf::Leaf) = (lf.coeff, Tuple((objectid(f.thr), f.accepted) for f in lf.factors))
 
 vecof(f::RatForm, aidx::Dict{Atom,Int}, nA::Int) =
     (v = zeros(Q, nA); for (a, c) in f; v[aidx[a]] = c; end; v)
 
-# ---- build all the index structures from the BFS result -------------------
+# ---- atom collection: every coupling that appears anywhere ----
+function _collect_atoms_th!(set::Set{Atom}, t::ThExpr)
+    if t isa ThConst
+    elseif t isa ThBoltz; for a in keys(t.L); push!(set,a); end
+    elseif t isa ThOp; _collect_atoms_th!(set,t.a); _collect_atoms_th!(set,t.b)
+    elseif t isa ThMin; _collect_atoms_th!(set,t.a); _collect_atoms_th!(set,t.b)
+    else; for (gs,v) in t.clauses; for g in gs, a in keys(g.lhs); push!(set,a); end; _collect_atoms_th!(set,v); end; _collect_atoms_th!(set,t.default)
+    end
+end
+
+# ---- "static" Val evaluation of a condition-free ThExpr (ThMin operands) ----
+# Errors if it meets a ThPiece/ThMin, i.e. the operands of a Min must not
+# themselves contain conditions (true for VMMC; fail-loud otherwise).
+function eval_static(t::ThExpr, aidx, nA)::Val
+    if t isa ThConst; val_const(t.c, nA)
+    elseif t isa ThBoltz; val_boltz(to_vec(t.L, aidx, nA))
+    elseif t isa ThOp
+        a = eval_static(t.a,aidx,nA); b = eval_static(t.b,aidx,nA)
+        t.op === :+ ? val_add(a,b,nA) : t.op === :- ? val_sub(a,b,nA) :
+        t.op === :* ? val_mul(a,b)    : val_div(a,b)
+    else
+        cant("Min over a condition-bearing expression is not supported")
+    end
+end
+
+# Condition implied by Min[a,b] (TRUE iff a < b), as (eff_lhs, strict).
+# Requires the cleared-denominator difference a-b to be a balanced binomial
+# c*(exp(-bL1) - exp(-bL2)); then a<b reduces to the linear form (L1-L2)>0.
+#
+# SOUNDNESS ASSUMPTION: clearing the operands' (1-exp) denominators preserves
+# the inequality direction only where those denominators are POSITIVE. This
+# holds wherever the Min is actually evaluated, because (as in VMMC) the Min
+# sits under a guard that forces denominator positivity (e.g. eInit<eFwd makes
+# 1-exp(-b*(eFwd-eInit)) > 0). The registered hyperplane is correct in that
+# region; in chambers where the guard fails the Min is never reached, so the
+# condition's value there is irrelevant. A Min used WITHOUT such a guard would
+# need explicit denominator-sign tracking (not implemented) -- see AUDIT.md.
+function min_condition(a::ThExpr, b::ThExpr, aidx, nA)
+    va = eval_static(a, aidx, nA); vb = eval_static(b, aidx, nA)
+    numer = bs_sub(bs_mul(va.num, expand_binoms(vb.den, nA)),
+                   bs_mul(vb.num, expand_binoms(va.den, nA)))   # numerator of (a-b)
+    isempty(numer) && return nothing                            # a == b, no condition
+    length(numer) == 2 || cant("Min condition is not a linear hyperplane (numerator has $(length(numer)) terms)")
+    (k1,c1),(k2,c2) = collect(numer)
+    c1 == -c2 || cant("Min condition numerator is an unbalanced binomial (not a hyperplane)")
+    kp, km = c1 > 0 ? (k1,k2) : (k2,k1)                         # +coeff key, -coeff key
+    # a<b  <=>  numer<0  <=>  exp(-b*kp) < exp(-b*km)  <=>  kp>km  <=>  (km-kp)<0
+    eff = kp .- km                                              # sigma=1 (a<b) iff eff.J > 0
+    (eff, true)
+end
+
+# ---- exact Val evaluation of a ThExpr under a chamber sign pattern ----
+function eval_val(t::ThExpr, σ::Vector{Int}, ctx, aidx, nA)::Val
+    if t isa ThConst; val_const(t.c, nA)
+    elseif t isa ThBoltz; val_boltz(to_vec(t.L, aidx, nA))
+    elseif t isa ThOp
+        a = eval_val(t.a,σ,ctx,aidx,nA); b = eval_val(t.b,σ,ctx,aidx,nA)
+        t.op === :+ ? val_add(a,b,nA) : t.op === :- ? val_sub(a,b,nA) :
+        t.op === :* ? val_mul(a,b)    : val_div(a,b)
+    elseif t isa ThMin
+        idx = ctx.thmin[objectid(t)]
+        idx == 0 ? eval_val(t.a,σ,ctx,aidx,nA) :                 # a==b
+            (σ[idx]==1 ? eval_val(t.a,σ,ctx,aidx,nA) : eval_val(t.b,σ,ctx,aidx,nA))
+    else  # ThPiece
+        for (gs,v) in t.clauses
+            all(σ[ctx.cidx[(-vecof(g.lhs,aidx,nA), g.strict)]]==1 for g in gs) &&
+                return eval_val(v,σ,ctx,aidx,nA)
+        end
+        eval_val(t.default,σ,ctx,aidx,nA)
+    end
+end
+
+val_add(a::Val,b::Val,nA) = (D=ms_unionmax(a.den,b.den);
+    Val(bs_addsum(bs_mul(a.num,expand_binoms(ms_diff(D,a.den),nA)),
+                  bs_mul(b.num,expand_binoms(ms_diff(D,b.den),nA))), D))
+val_sub(a::Val,b::Val,nA) = (D=ms_unionmax(a.den,b.den);
+    Val(bs_sub(bs_mul(a.num,expand_binoms(ms_diff(D,a.den),nA)),
+               bs_mul(b.num,expand_binoms(ms_diff(D,b.den),nA))), D))
+# a / b  where b must be a single binomial (1 - exp(-beta*L)).
+function val_div(a::Val, b::Val)
+    isempty(b.den) && length(b.num)==2 || cant("division by a non-binomial threshold")
+    z = nothing; L = nothing
+    for (k,c) in b.num
+        if all(==(0), k); c==1 || cant("bad binomial numerator"); z=k
+        else; c==-1 || cant("bad binomial numerator"); L=k; end
+    end
+    (z===nothing || L===nothing) && cant("division denominator is not (1 - exp)")
+    Val(a.num, vcat(a.den, [L]))
+end
+
+# ---- the DB model ----
+# Leaf weights stay symbolic (representative ThExpr leaves); their per-chamber
+# Val is evaluated lazily and cached, and each pair is checked once per DISTINCT
+# projection of the chambers onto that pair's active conditions (usually a
+# handful), instead of once per chamber.
 struct DBModel
-    atoms          :: Vector{Atom}
     aidx           :: Dict{Atom,Int}
-    conds          :: Vector{RatForm}          # allConds (each is cond_lhs of cond_lhs<=0)
-    cond_idx       :: Dict{Any,Int}
-    cond_eff_lhs   :: Vector{Vector{Q}}        # sigma=1 iff eff_lhs . J >= 0
+    nA             :: Int
+    cond_eff_lhs   :: Vector{Vector{Q}}        # sigma=1 iff eff_lhs . J >= 0 (>0 if strict)
     cond_is_strict :: Vector{Bool}
-    energy_coeffs  :: Vector{Vector{Q}}        # per state
+    energy_coeffs  :: Vector{Vector{Q}}
+    ctx                                        # (cidx, thmin) for ThExpr evaluation
     uweights       :: Vector{Leaf}             # representative leaf per unique weight
-    uw_idx         :: Dict{Any,Int}
     uw_active      :: Vector{Vector{Int}}      # active cond indices per unique weight
-    uw_cases       :: Vector{Dict{Vector{Int},Vector{Tuple{Q,Vector{Q}}}}}  # sigma(active)->terms
-    pairs          :: Vector{Tuple{Int,Int}}   # (i<j) communicating pairs
-    ij_srcs        :: Vector{Vector{Int}}      # unique-weight idx per i->j leaf
-    ji_srcs        :: Vector{Vector{Int}}      # unique-weight idx per j->i leaf
+    pairs          :: Vector{Tuple{Int,Int}}
+    ij_srcs        :: Vector{Vector{Int}}
+    ji_srcs        :: Vector{Vector{Int}}
 end
 
 function build_dbmodel(bfs::BFSResult, energy)::DBModel
-    nS = length(bfs.states)
+    uweights = bfs.uweights                                  # already deduped (rep weights)
 
-    # --- collect conditions (dedup by RatForm) ---
-    conds = RatForm[]; cond_idx = Dict{Any,Int}()
-    function cidx!(f::RatForm)
-        k = _form_key(f)
-        haskey(cond_idx, k) && return cond_idx[k]
-        push!(conds, f); cond_idx[k] = length(conds); length(conds)
-    end
-    for i in 1:nS, lf in bfs.leaves[i], fac in lf.factors
-        cidx!(fac.cond)
-    end
-
-    # --- atom list: union over conditions, exponents, and state energies ---
-    state_energy = Vector{RatForm}(undef, nS)
-    for i in 1:nS
-        state_energy[i] = tau0_form(energy(concrete_pstate(bfs.states[i])))
-    end
+    # --- atoms (couplings) over the unique thresholds and the state energies ---
+    state_energy = [tau0_form(energy(concrete_pstate(cs))) for cs in bfs.states]
     atomset = Set{Atom}()
-    for f in conds, a in keys(f); push!(atomset, a); end
-    for i in 1:nS, lf in bfs.leaves[i], fac in lf.factors, a in keys(fac.expo); push!(atomset, a); end
-    for i in 1:nS, a in keys(state_energy[i]); push!(atomset, a); end
-    atoms = sort(collect(atomset))
-    aidx  = Dict(a => i for (i, a) in enumerate(atoms)); nA = length(atoms)
+    for lf in uweights, f in lf.factors; _collect_atoms_th!(atomset, f.thr); end
+    for se in state_energy, a in keys(se); push!(atomset, a); end
+    atoms = sort(collect(atomset)); aidx = Dict(a=>i for (i,a) in enumerate(atoms)); nA = length(atoms)
+    energy_coeffs = [vecof(se, aidx, nA) for se in state_energy]
 
-    k = length(conds)
-    cond_eff_lhs = Vector{Vector{Q}}(undef, k)
-    cond_is_strict = fill(false, k)   # all conditions here are `<= 0` (LessEqual)
-    for i in 1:k
-        # LessEqual: cond TRUE iff cond_lhs <= 0 iff (-cond_lhs).J >= 0
-        cond_eff_lhs[i] = -vecof(conds[i], aidx, nA)
+    # --- condition registry: (eff_lhs, strict) -> index ; ThMin object -> index ---
+    cidx = Dict{Tuple{Vector{Q},Bool},Int}()
+    eff_list = Vector{Q}[]; strict_list = Bool[]
+    register!(eff::Vector{Q}, strict::Bool) = get!(cidx, (eff,strict)) do
+        push!(eff_list, eff); push!(strict_list, strict); length(eff_list)
     end
-
-    energy_coeffs = [vecof(state_energy[i], aidx, nA) for i in 1:nS]
-
-    # --- unique weights + compact term tables ---
-    uweights = Leaf[]; uw_idx = Dict{Any,Int}()
-    function widx!(lf::Leaf)
-        key = _weight_key(lf)
-        haskey(uw_idx, key) && return uw_idx[key]
-        push!(uweights, lf); uw_idx[key] = length(uweights); length(uweights)
-    end
-
-    # --- ordered transitions ---
-    trans = Dict{Tuple{Int,Int},Vector{Int}}()   # (i,j)->[uw idx per leaf]
-    for i in 1:nS, lf in bfs.leaves[i]
-        j = bfs.idx[lf.next]
-        j == i && continue
-        push!(get!(trans, (i, j), Int[]), widx!(lf))
-    end
-
-    uw_active, uw_cases = _compact_weights(uweights, cond_idx, aidx, nA, k)
-
-    # --- communicating pairs ---
-    pairset = Set{Tuple{Int,Int}}()
-    for (i, j) in keys(trans)
-        push!(pairset, (min(i, j), max(i, j)))
-    end
-    pairs = sort(collect(pairset))
-    ij_srcs = [get(trans, (a, b), Int[]) for (a, b) in pairs]
-    ji_srcs = [get(trans, (b, a), Int[]) for (a, b) in pairs]
-
-    DBModel(atoms, aidx, conds, cond_idx, cond_eff_lhs, cond_is_strict,
-            energy_coeffs, uweights, uw_idx, uw_active, uw_cases,
-            pairs, ij_srcs, ji_srcs)
-end
-
-# Build, per unique weight, the active condition indices and the term table
-# for every truth assignment of those conditions (sigma-substitution).
-function _compact_weights(uweights, cond_idx, aidx, nA, k)
-    uw_active = Vector{Vector{Int}}(undef, length(uweights))
-    uw_cases  = Vector{Dict{Vector{Int},Vector{Tuple{Q,Vector{Q}}}}}(undef, length(uweights))
-    for (wi, lf) in enumerate(uweights)
-        active = sort(unique(Int[cond_idx[_form_key(f.cond)] for f in lf.factors]))
-        uw_active[wi] = active
-        ka = length(active)
-        apos = Dict(c => p for (p, c) in enumerate(active))
-        cases = Dict{Vector{Int},Vector{Tuple{Q,Vector{Q}}}}()
-        for mask in 0:(2^ka - 1)
-            asg = [(mask >> (p - 1)) & 1 for p in 1:ka]   # value per active cond
-            terms = Tuple{Q,Vector{Q}}[(lf.coeff, zeros(Q, nA))]
-            for f in lf.factors
-                ci = cond_idx[_form_key(f.cond)]
-                sig = asg[apos[ci]]                       # 1 = cond TRUE
-                g = vecof(f.expo, aidx, nA)
-                if f.accepted
-                    if sig == 0                            # threshold exp(-beta*g)
-                        terms = [(c, e .+ g) for (c, e) in terms]
-                    end                                    # sig==1 -> factor 1
-                else
-                    if sig == 1                            # 1 - 1 = 0
-                        terms = Tuple{Q,Vector{Q}}[]
-                    else                                   # 1 - exp(-beta*g)
-                        terms = vcat(terms, [(-c, e .+ g) for (c, e) in terms])
-                    end
-                end
+    thmin = Dict{UInt,Int}()                       # ThMin objectid -> cond index (0 = a==b)
+    function scan!(t::ThExpr)
+        if t isa ThOp; scan!(t.a); scan!(t.b)
+        elseif t isa ThMin
+            if !haskey(thmin, objectid(t))     # shared interned node: derive once
+                mc = min_condition(t.a, t.b, aidx, nA)
+                thmin[objectid(t)] = mc === nothing ? 0 : register!(-mc[1], mc[2])  # sigma=1 iff a<b
             end
-            cases[asg] = _combine_terms(terms, nA)
+            scan!(t.a); scan!(t.b)
+        elseif t isa ThPiece
+            for (gs,v) in t.clauses
+                for g in gs; register!(-vecof(g.lhs,aidx,nA), g.strict); end
+                scan!(v)
+            end
+            scan!(t.default)
         end
-        uw_cases[wi] = cases
     end
-    uw_active, uw_cases
-end
+    for lf in uweights, f in lf.factors; scan!(f.thr); end
+    ctx = (cidx=cidx, thmin=thmin)
 
-function _combine_terms(terms, nA)
-    acc = Dict{Vector{Q},Q}()
-    for (c, e) in terms
-        acc[e] = get(acc, e, Q(0)) + c
+    # --- transitions -> per-pair weight-index lists ---
+    trans = Dict{Tuple{Int,Int},Vector{Int}}()
+    for (s, d, wi) in bfs.trans; push!(get!(trans,(s,d),Int[]), wi); end
+
+    # --- per unique weight: active conds ---
+    function factor_conds(t::ThExpr, acc::Set{Int})
+        if t isa ThOp; factor_conds(t.a,acc); factor_conds(t.b,acc)
+        elseif t isa ThMin; (i=thmin[objectid(t)]; i!=0 && push!(acc,i)); factor_conds(t.a,acc); factor_conds(t.b,acc)
+        elseif t isa ThPiece
+            for (gs,v) in t.clauses; for g in gs; push!(acc, cidx[(-vecof(g.lhs,aidx,nA),g.strict)]); end; factor_conds(v,acc); end
+            factor_conds(t.default,acc)
+        end
     end
-    [(c, e) for (e, c) in acc if c != 0]
+    uw_active = Vector{Vector{Int}}(undef, length(uweights))
+    for (wi, lf) in enumerate(uweights)
+        accset = Set{Int}(); for f in lf.factors; factor_conds(f.thr, accset); end
+        uw_active[wi] = sort(collect(accset))
+    end
+
+    pairset = Set{Tuple{Int,Int}}(); for (i,j) in keys(trans); push!(pairset,(min(i,j),max(i,j))); end
+    pairs = sort(collect(pairset))
+    ij_srcs = [get(trans,(a,b),Int[]) for (a,b) in pairs]
+    ji_srcs = [get(trans,(b,a),Int[]) for (a,b) in pairs]
+
+    DBModel(aidx, nA, eff_list, strict_list, energy_coeffs, ctx,
+            uweights, uw_active, pairs, ij_srcs, ji_srcs)
 end
 
 # ---- Phase 2: chamber enumeration via HiGHS LP BFS + degenerate filter ----
@@ -668,7 +904,7 @@ function _filter_degenerate(feasible, eff, strict, k)
 end
 
 function enumerate_chambers(m::DBModel)::Vector{Vector{Int}}
-    k = length(m.conds); nA = length(m.atoms)
+    k = length(m.cond_eff_lhs); nA = m.nA
     k == 0 && return [Int[]]
     # generic interior witness: J*_a = 100^a guarantees no real condition is 0.
     Jstar = Q[Q(100)^a for a in 1:nA]
@@ -691,34 +927,57 @@ function enumerate_chambers(m::DBModel)::Vector{Vector{Int}}
     _filter_degenerate(feasible, m.cond_eff_lhs, m.cond_is_strict, k)
 end
 
-# ---- Phase 3: exact rational DB check over all chambers --------------------
-# Project a full chamber sigma onto a unique weight's active conditions.
-function _terms_for(m::DBModel, wi::Int, sigma::Vector{Int})
-    asg = Int[sigma[c] for c in m.uw_active[wi]]
-    m.uw_cases[wi][asg]
-end
-
+# ---- Phase 3: exact DB check (lazy Val cache + per-pair condition projection) ----
 # Returns (pass, violations) where each violation is (i, j, chamber_index).
 function run_db_check(m::DBModel)
-    chambers = enumerate_chambers(m)
+    chambers = enumerate_chambers(m); nA = m.nA; nC = length(m.cond_eff_lhs)
+    # Lazy, cached leaf Val: depends only on the projection of sigma onto the
+    # weight's active conditions, so one evaluation serves every chamber sharing
+    # that projection.
+    cache = Dict{Tuple{Int,Vector{Int}}, Val}()
+    function leaf_val(wi::Int, σ::Vector{Int})
+        asg = Int[σ[c] for c in m.uw_active[wi]]
+        get!(cache, (wi, asg)) do
+            v = val_const(m.uweights[wi].coeff, nA)
+            for f in m.uweights[wi].factors
+                fv = eval_val(f.thr, σ, m.ctx, m.aidx, nA)
+                v = val_mul(v, f.accepted ? fv : val_oneminus(fv, nA))
+            end
+            v
+        end
+    end
+    # Residual numerator for one pair under one chamber (denominators cleared).
+    function residual_zero(p::Int, σ::Vector{Int})
+        i, j = m.pairs[p]; ei = m.energy_coeffs[i]; ej = m.energy_coeffs[j]
+        D = ExpVec[]
+        for wi in m.ij_srcs[p]; D = ms_unionmax(D, leaf_val(wi,σ).den); end
+        for wi in m.ji_srcs[p]; D = ms_unionmax(D, leaf_val(wi,σ).den); end
+        res = BSum()
+        for wi in m.ij_srcs[p]
+            v = leaf_val(wi,σ)
+            for (L,c) in bs_mul(bs_shift(v.num, ei), expand_binoms(ms_diff(D,v.den), nA)); bs_add!(res,L,c); end
+        end
+        for wi in m.ji_srcs[p]
+            v = leaf_val(wi,σ)
+            for (L,c) in bs_mul(bs_shift(v.num, ej), expand_binoms(ms_diff(D,v.den), nA)); bs_add!(res,L,-c); end
+        end
+        isempty(res)
+    end
+
     violations = Tuple{Int,Int,Int}[]
-    for (ridx, sigma) in enumerate(chambers)
-        for p in eachindex(m.pairs)
-            (isempty(m.ij_srcs[p]) && isempty(m.ji_srcs[p])) && continue
-            i, j = m.pairs[p]
-            ei = m.energy_coeffs[i]; ej = m.energy_coeffs[j]
-            groups = Dict{Vector{Q},Q}()
-            for wi in m.ij_srcs[p], (c, g) in _terms_for(m, wi, sigma)
-                key = g .+ ei
-                groups[key] = get(groups, key, Q(0)) + c
-            end
-            for wi in m.ji_srcs[p], (c, g) in _terms_for(m, wi, sigma)
-                key = g .+ ej
-                groups[key] = get(groups, key, Q(0)) - c
-            end
-            if any(c != 0 for c in values(groups))
-                push!(violations, (i, j, ridx))
-            end
+    for p in eachindex(m.pairs)
+        (isempty(m.ij_srcs[p]) && isempty(m.ji_srcs[p])) && continue
+        # Active conditions for this pair: only these distinguish its chambers.
+        apset = Set{Int}()
+        for wi in m.ij_srcs[p]; union!(apset, m.uw_active[wi]); end
+        for wi in m.ji_srcs[p]; union!(apset, m.uw_active[wi]); end
+        ap = sort(collect(apset))
+        seen = Set{Vector{Int}}()
+        for (ridx, σ) in enumerate(chambers)
+            proj = Int[σ[c] for c in ap]
+            proj in seen && continue
+            push!(seen, proj)
+            residual_zero(p, σ) || push!(violations, (m.pairs[p][1], m.pairs[p][2], ridx))
         end
     end
     (isempty(violations), violations, length(chambers))

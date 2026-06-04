@@ -37,7 +37,7 @@ function parse_args(argv)
     isempty(argv) && (println("Usage: julia check.jl <algorithm.jl> [-maxdepth N]"); exit(1))
     algfile = argv[1]
     isfile(algfile) || (println("ERROR: file not found: ", algfile); exit(1))
-    maxdepth = 22
+    maxdepth = 30
     i = 2
     while i <= length(argv)
         if argv[i] == "-maxdepth"
